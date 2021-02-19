@@ -1,0 +1,6 @@
+DEFAULT pxeboot
+TIMEOUT 20
+PROMPT 0
+LABEL pxeboot
+    KERNEL images/rhcos-4.5.6-x86_64-installer-kernel-x86_64
+    APPEND initrd=images/rhcos-4.5.6-x86_64-installer-initramfs.x86_64.img rd.neednet=1 ip=dhcp console=tty0 console=ttyS0 coreos.inst=yes coreos.inst.install_dev=sda coreos.inst.image_url=http://10.0.45.1:8080/install/rhcos-4.5.6-x86_64-metal.x86_64.raw.gz coreos.inst.ignition_url=http://10.0.45.1:8080/ignition/bootstrap.ign

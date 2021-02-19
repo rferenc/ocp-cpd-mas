@@ -1,0 +1,253 @@
+# Installation of IBM Cloud Pak for Data 3.5
+# ============================================================================================
+
+######## installation parameters ########
+
+export ENTITLEMENT="my_entitlement_key_from_ibm"
+
+
+######## preparation ########
+
+mkdir -p /home/install/cpd
+cd /home/install/cpd
+
+# login to OpenShift
+oc login --insecure-skip-tls-verify -u admin -p passw0rd https://api.ocp45.mydomain.com:6443
+
+
+######## tuning CRIO for CPD ########
+# https://www.ibm.com/support/knowledgecenter/SSQNUZ_3.5.0/cpd/install/node-settings.html?view=kc#node-settings__crio
+
+yum -y install python3
+
+# get a worker node name from the cluster
+workernode=$(oc get nodes | grep worker | head -1 | awk '{print $1}')
+
+# cache ssh key - no need to enter "yes" :)
+ssh-keyscan -H $workernode >> /root/.ssh/known_hosts
+
+# get an actual crio.conf from a worker node
+scp core@$workernode:/etc/crio/crio.conf /tmp/crio.conf
+
+cat  /tmp/crio.conf | grep -v -e "^#" | grep -v -e "^$" | grep -v pids_limit > ./crio.conf
+
+# increase file and pid limits to the recommended
+sed -i '/\[crio.runtime\]/a\
+default_ulimits = [\
+        "nofile=66560:66560"\
+]\
+pids_limit = 12288 ' ./crio.conf
+
+# store the new file in an env variable
+crio_conf=$(cat ./crio.conf | python3 -c "import sys, urllib.parse; print(urllib.parse.quote(''.join(sys.stdin.readlines())))")
+
+# create new machineconfig with this new crio conf
+cat << EOF > 51-worker-cp4d-crio-conf.yaml
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+ labels:
+   machineconfiguration.openshift.io/role: worker
+ name: 51-worker-cp4d-crio-conf
+spec:
+ config:
+   ignition:
+     version: 2.2.0
+   storage:
+     files:
+     - contents:
+         source: data:,${crio_conf}
+       filesystem: root
+       mode: 0644
+       path: /etc/crio/crio.conf
+EOF
+
+# apply as patch
+oc create -f 51-worker-cp4d-crio-conf.yaml
+
+
+######## tuning kernel parameters for CPD ########
+# https://www.ibm.com/support/knowledgecenter/SSQNUZ_3.5.0/cpd/install/node-settings.html?view=kc#node-settings__kernel
+
+cat << EOF > 42-cp4d.yaml
+apiVersion: tuned.openshift.io/v1
+kind: Tuned
+metadata:
+  name: cp4d-wkc-ipc
+  namespace: openshift-cluster-node-tuning-operator
+spec:
+  profile:
+  - name: cp4d-wkc-ipc
+    data: |
+      [main]
+      summary=Tune IPC Kernel parameters on OpenShift Worker Nodes running WKC Pods
+      [sysctl]
+      kernel.shmall = 33554432
+      kernel.shmmax = 68719476736
+      kernel.shmmni = 16384
+      kernel.sem = 250 1024000 100 16384
+      kernel.msgmax = 65536
+      kernel.msgmnb = 65536
+      kernel.msgmni = 32768
+      vm.max_map_count = 262144
+  recommend:
+  - match:
+    - label: node-role.kubernetes.io/worker
+    priority: 10
+    profile: cp4d-wkc-ipc
+EOF
+oc create -f 42-cp4d.yaml
+
+
+######## get install files ########
+
+# Latest: https://github.com/IBM/cpd-cli/releases
+curl -s https://github.com/IBM/cpd-cli/releases/download/v3.5.2/cpd-cli-linux-EE-3.5.2.tgz | tar -xvz
+
+# add the entitlement key to the repo file
+sed -i "s/apikey: <entitlement key>$/apikey: $ENTITLEMENT/" repo.yaml
+
+
+# Latest: https://github.com/IBM/cloud-pak-cli/releases
+curl -s https://github.com/IBM/cloud-pak-cli/releases/download/v3.7.0/cloudctl-linux-amd64.tar.gz | tar -xvz
+
+chmod 755 cloudctl-linux-amd64
+mv cloudctl-linux-amd64 /usr/local/bin/cloudctl
+
+# Latest: https://github.com/IBM/cloud-pak/tree/master/repo/case/ibm-cp-datacore/
+curl -s https://github.com/IBM/cloud-pak/raw/master/repo/case/ibm-cp-datacore/1.3.3/ibm-cp-datacore-1.3.3.tgz | tar -xvz
+
+# get registry info from OpenShift and login
+REGISTRY=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
+podman login -u $(oc whoami) -p $(oc whoami -t) --tls-verify=false $REGISTRY
+
+
+######## install Cloud Pak for Data operator ########
+# https://www.ibm.com/support/knowledgecenter/SSQNUZ_3.5.0/cpd/install/cpd-operator-connected.html
+
+oc new-project cpd-meta-ops
+
+export CPD_REGISTRY=cp.icr.io/cp/cpd
+export CPD_REGISTRY_USER=cp
+export CPD_REGISTRY_PASSWORD=$ENTITLEMENT
+export NAMESPACE=cpd-meta-ops
+
+# install
+cloudctl case launch --case ibm-cp-datacore --namespace ${NAMESPACE} --inventory cpdMetaOperatorSetup -action install-operator  --tolerance=1 --args "--entitledRegistry ${CPD_REGISTRY} --entitledUser ${CPD_REGISTRY_USER} --entitledPass ${CPD_REGISTRY_PASSWORD}"
+
+# check
+oc get pods -n ${NAMESPACE} -l name=ibm-cp-data-operator
+
+
+
+
+
+######## install Cloud Pak for Data packages ########
+
+oc new-project cpd
+
+# ---------- AIR-GAPPED INSTALL
+#
+# assembly keywords: https://github.com/IBM/cloud-pak/tree/master/repo/cpd/3.5/assembly
+#
+# 3.5.2
+#   lite  - core
+#   db2wh - DB2 Warehouse Edition
+#   dmc   - DB2 Data Management Console
+# 3.5.1
+#   wsl   - Watson Studio
+#   wml   - Watson Machine learning
+# 3.5.0
+#   mongodb - MongoDB Enterprise
+
+
+# to download from internet:
+./cpd-cli preload-images --repo repo.yaml --arch x86_64 --action download --accept-all-licenses --assembly lite
+
+# transfer to air-gapped environment!!!
+tar -cJvf cpd-cli-lite-workspace-3.5.1.tar.xy cpd-cli-workspace
+scp cpd-cli-lite-workspace-3.5.1.tar.xy user@10.0.0.2:/ftproot/ocp4/cpd/
+
+
+# get the pre-downloaded images in the air-gapped environment
+curl -s ftp://10.0.0.2/ocp4/cpd/cpd-cli-lite-workspace-3.5.2.tar.xy | tar -xvJ
+
+
+### installing "LITE" assembly - change the keyword if you want to install another
+
+
+# check needed security context, RBAC, roles, etc.
+./cpd-cli adm --repo ./repo.yaml --arch x86_64 --namespace cpd --accept-all-licenses --assembly lite
+
+# and apply
+./cpd-cli adm --repo ./repo.yaml --arch x86_64 --namespace cpd --accept-all-licenses --assembly lite --apply
+
+
+# load images to registry
+./cpd-cli preload-images --arch x86_64 --action push --load-from /home/install/cpd/cpd-cli-workspace \
+  --insecure-skip-tls-verify --target-registry-username $(oc whoami) --target-registry-password $(oc whoami -t) \
+  --transfer-image-to default-route-openshift-image-registry.apps.ocp45.mydomain.com/cpd --accept-all-licenses --assembly lite
+
+
+# dry run
+./cpd-cli install --arch x86_64 --namespace cpd --storageclass managed-nfs-storage \
+--insecure-skip-tls-verify --cluster-pull-prefix image-registry.openshift-image-registry.svc:5000/cpd \
+--load-from /home/install/cpd/cpd-cli-workspace --latest-dependency --accept-all-licenses --dry-run --assembly lite
+
+# and install
+./cpd-cli install --arch x86_64 --namespace cpd --storageclass managed-nfs-storage \
+--insecure-skip-tls-verify --cluster-pull-prefix image-registry.openshift-image-registry.svc:5000/cpd \
+--load-from /home/install/cpd/cpd-cli-workspace --latest-dependency --accept-all-licenses --verbose --assembly lite
+
+
+
+# ---------- AIR-GAPPED INSTALL END
+
+
+
+# ---------- ONLINE INSTALL
+
+./cpd-cli adm --repo ./repo.yaml --arch x86_64 --namespace cpd --accept-all-licenses --assembly lite
+./cpd-cli adm --repo ./repo.yaml --arch x86_64 --namespace cpd --accept-all-licenses --assembly lite --apply
+
+./cpd-cli install --repo ./repo.yaml --assembly lite --namespace cpd --storageclass managed-nfs-storage  \
+  --transfer-image-to default-route-openshift-image-registry.apps.ocp45.mydomain.com/cpd --cluster-pull-prefix image-registry.openshift-image-registry.svc:5000/cpd \
+  --target-registry-username $(oc whoami) --target-registry-password $(oc whoami -t) --insecure-skip-tls-verify  \
+  --latest-dependency \
+  --dry-run
+
+./cpd-cli install --repo ./repo.yaml --assembly lite --namespace cpd --storageclass managed-nfs-storage  \
+  --transfer-image-to default-route-openshift-image-registry.apps.ocp45.mydomain.com/cpd --cluster-pull-prefix image-registry.openshift-image-registry.svc:5000/cpd \
+  --target-registry-username $(oc whoami) --target-registry-password $(oc whoami -t) --insecure-skip-tls-verify  \
+  --latest-dependency
+
+# ---------- ONLINE INSTALL END
+
+
+# ######## you will see a similar message if succeed :) ########
+# [INFO] [2021-01-25 15:35:10-0786] Access the web console at https://cpd-cpd-cpd.apps.ocp4.mydomain.com
+#                             Login credeitnals:              admin / password
+
+
+######## post install commands - if needed ########
+
+# check status
+./cpd-cli status --namespace cpd --assembly lite
+
+
+# update
+./cpd-cli status --repo ./repo.yaml --namespace cpd --patches --available-updates --assembly lite
+
+# uninstall
+./cpd-cli  uninstall --namespace cpd --assembly lite
+
+
+
+# if you want to use node labeling for databases
+oc label node compute-0.ocp45.mydomain.com icp4data=database-db2wh --overwrite
+oc label node compute-1.ocp45.mydomain.com icp4data=database-db2wh --overwrite
+oc label node compute-2.ocp45.mydomain.com icp4data=database-db2wh --overwrite
+
+oc label node compute-0.ocp45.mydomain.com icp4data=database-mongodb --overwrite
+oc label node compute-1.ocp45.mydomain.com icp4data=database-mongodb --overwrite
+oc label node compute-2.ocp45.mydomain.com icp4data=database-mongodb --overwrite

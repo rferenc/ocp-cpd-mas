@@ -1,0 +1,45 @@
+$ORIGIN mydomain.com.
+$TTL 86400
+
+; SOA Record
+@                       IN      SOA     srv.mydomain.com.       admin.mydomain.com.   (
+2021021735       ;serial
+14400    ;refresh
+1800     ;retry
+1209600  ;expire
+3600     ;minimum ttl
+)
+
+; NS Records
+@       IN      NS      srv.mydomain.com.
+
+; MX Records
+@       IN      MX      10      srv.mydomain.com.
+
+; A Records
+srv             IN      A       10.0.0.2
+gw              IN      A       10.0.0.3
+
+bastion.ocp45   IN      A       10.0.45.1
+api.ocp45       IN      A       10.0.45.1
+api-int.ocp45   IN      A       10.0.45.1
+*.apps.ocp45    IN      A       10.0.45.1
+bootstrap.ocp45 IN      A       10.0.45.10
+control-0.ocp45 IN      A       10.0.45.11
+control-1.ocp45 IN      A       10.0.45.12
+control-2.ocp45 IN      A       10.0.45.13
+compute-0.ocp45 IN      A       10.0.45.21
+compute-1.ocp45 IN      A       10.0.45.22
+compute-2.ocp45 IN      A       10.0.45.23
+compute-3.ocp45 IN      A       10.0.45.24
+compute-4.ocp45 IN      A       10.0.45.25
+compute-5.ocp45 IN      A       10.0.45.26
+etcd-0.ocp45    IN      A       10.0.45.11
+etcd-1.ocp45    IN      A       10.0.45.12
+etcd-2.ocp45    IN      A       10.0.45.13
+
+
+; SRV Records
+_etcd-server-ssl._tcp.ocp4      IN      SRV     0       10      2380    etcd-0.ocp45.mydomain.com.
+_etcd-server-ssl._tcp.ocp4      IN      SRV     0       10      2380    etcd-1.ocp45.mydomain.com.
+_etcd-server-ssl._tcp.ocp4      IN      SRV     0       10      2380    etcd-2.ocp45.mydomain.com.

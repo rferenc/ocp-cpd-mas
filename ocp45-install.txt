@@ -1,0 +1,381 @@
+# Installation of Red Hat Openshift 4.5
+# ============================================================================================
+
+# Environment:
+#
+# bastion          10.0.45.1      management linux, OS installed: Red Hat Enterprise Linux 7.5
+#                                 almost all commands executed here
+#                                 fix IP, 4 CPU, 32G mem, 256+1024G disk (2nd disk for NFS)
+# bootstrap        10.0.45.10     DHCP, PXE boot - CoreOS  8 CPU, 32G mem, 256G disk
+# 3 x master node  10.0.45.11-13  DHCP, PXE boot - CoreOS  8 CPU, 32G mem, 256G disk
+# 3+ x worker node 10.0.45.21-2x  DHCP, PXE boot - CoreOS  16 CPU, 64G mem, 256G disk
+#
+# DNS, DHCP, PXE server out of the scope, but some sample will be in the GIT repo
+
+
+######## installation parameters ########
+
+export RHN_USERNAME='myrhnuser'
+export RHN_PASSWORD='myrhnpassword'
+export RHN_PULLSECRET='{"auths":{"cloud.openshift.com":{"auth":.......}}}'
+
+# Get your PULLSECRET here: https://cloud.redhat.com/openshift/install/metal/user-provisioned
+
+
+
+######## Preparation ########
+
+echo "LANG=en_US.utf-8" >> /etc/environment
+echo "LC_ALL=en_US.utf-8" >> /etc/environment
+
+# changing network parameters
+nmcli con mod ens192 ipv4.addresses "10.0.45.1/16"
+nmcli con mod ens192 ipv4.dns "10.0.0.2"
+nmcli con mod ens192 ipv4.gateway "10.0.0.3"
+hostnamectl set-hostname bastion.ocp45.mydomain.com
+nmcli con mod ens192 ipv4.dns-search "ocp45.mydomain.com"
+systemctl restart NetworkManager.service
+
+
+
+
+######## prepare NFS share on the second disk ########
+
+# create LVM
+pvcreate /dev/sdb
+vgcreate storage /dev/sdb
+lvcreate -l 100%FREE -n nfs storage
+
+# format
+mkfs.xfs /dev/mapper/storage-nfs
+
+# add to fstab
+echo "/dev/mapper/storage-nfs /storage                xfs     defaults        0 0" >> /etc/fstab
+
+# mount
+mkdir /storage
+mount /storage
+
+# setup NFS
+yum -y install nfs-utils
+systemctl enable rpcbind
+systemctl enable nfs-lock
+systemctl enable nfs
+
+firewall-cmd --permanent --add-service=nfs
+firewall-cmd --reload
+
+# create shares - pv_0001 will be used by OpenShift
+cd /storage
+
+mkdir pv_0001
+mkdir pv_0002
+mkdir pv_0003
+chown nfsnobody:nfsnobody pv_000*
+chmod 777 pv_000*
+
+cat <<EOF > /etc/exports.d/openshift.exports
+/storage/pv_0001 *(rw,no_root_squash,no_wdelay)
+/storage/pv_0002 *(rw,no_root_squash,no_wdelay)
+/storage/pv_0003 *(rw,no_root_squash,no_wdelay)
+EOF
+
+# start the NFS services
+systemctl start rpcbind
+systemctl start nfs-lock
+systemctl start nfs
+
+
+
+
+######## change dhcp mac addresses if needed and active PXE tftpboot configs now for CoreOS nodes ########
+
+
+######## Red Hat access ########
+subscription-manager register --username $RHN_USERNAME --password $RHN_PASSWORD
+subscription-manager refresh
+
+subscription-manager list --available
+
+# you will need: "Red Hat OpenShift Container Platform" from above list
+subscription-manager attach --pool=11223344aaff5566
+
+subscription-manager repos --enable=rhel-7-server-extras-rpms
+
+
+# install some packages
+yum -y install net-tools haproxy wget httpd selinux-policy policycoreutils-python podman httpd-tools git bind-utils
+
+cd /root
+
+######## Configuring HAProxy ########
+wget https://raw.githubusercontent.com/openshift-tigerteam/guides/master/ocp4/ocp4-haproxy.cfg
+
+# enable automatic stat refresh
+sed -i '/stats enable/a\
+    stats refresh 10s' ocp4-haproxy.cfg
+
+# bootstrap
+sed -i 's/192.168.1.96/10.0.45.10/' ocp4-haproxy.cfg
+
+# masters
+sed -i 's/master/control-/' ocp4-haproxy.cfg
+sed -i 's/192.168.1.97/10.0.45.11/' ocp4-haproxy.cfg
+sed -i 's/192.168.1.98/10.0.45.12/' ocp4-haproxy.cfg
+sed -i 's/192.168.1.99/10.0.45.13/' ocp4-haproxy.cfg
+
+# workers
+sed -i 's/worker/compute-/' ocp4-haproxy.cfg
+sed -i 's/192.168.1.11/10.0.45.21/' ocp4-haproxy.cfg
+sed -i 's/192.168.1.7/10.0.45.22/' ocp4-haproxy.cfg
+
+# additional workers - if needed :)
+sed -i '/server compute-1 10.0.45.22:80 check/a\
+    server compute-2 10.0.45.23:80 check\
+    server compute-3 10.0.45.24:80 check\
+    server compute-4 10.0.45.25:80 check\
+    server compute-5 10.0.45.26:80 check' ocp4-haproxy.cfg
+sed -i '/server compute-1 10.0.45.22:443 check/a\
+    server compute-2 10.0.45.23:443 check\
+    server compute-3 10.0.45.24:443 check\
+    server compute-4 10.0.45.25:443 check\
+    server compute-5 10.0.45.26:443 check' ocp4-haproxy.cfg
+
+# change timeout for CPD
+sed -i -e "/timeout client/s/ [0-9].*/ 5m/" ocp4-haproxy.cfg
+sed -i -e "/timeout server/s/ [0-9].*/ 5m/" ocp4-haproxy.cfg
+
+# move the config
+mv -f ocp4-haproxy.cfg /etc/haproxy/haproxy.cfg
+
+# setting SELinux
+setsebool -P haproxy_connect_any=1
+semanage permissive -a haproxy_t
+
+# start HAProxy
+systemctl enable haproxy
+systemctl start haproxy
+
+# setting firewall
+firewall-cmd --zone=public --add-port=80/tcp --permanent
+firewall-cmd --zone=public --add-port=443/tcp --permanent
+firewall-cmd --zone=public --add-port=22623/tcp --permanent
+firewall-cmd --zone=public --add-port=9000/tcp --permanent
+firewall-cmd --zone=public --add-port=6443/tcp --permanent
+firewall-cmd --reload
+
+######## configure http server to work on 8080 port - serve ingition files and coreos install ########
+sed -i 's/Listen 80/Listen 8080/' /etc/httpd/conf/httpd.conf
+
+# start http server
+systemctl enable httpd
+systemctl start httpd
+
+# enable on firewall
+firewall-cmd --zone=public --add-port=8080/tcp --permanent
+firewall-cmd --reload
+
+
+######## OCP Preparation ########
+
+# to serve some files later
+mkdir -p /home/install
+
+# generate rsa id
+ssh-keygen -N "" -f /root/.ssh/id_rsa
+
+
+# get install files
+
+# Latest: https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/latest/latest/
+wget https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/4.5/4.5.6/rhcos-4.5.6-x86_64-metal.x86_64.raw.gz
+
+cd /usr/local/bin/
+
+# Latest: https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/
+curl -s https://mirror.openshift.com/pub/openshift-v4/clients/ocp/4.5.27/openshift-client-linux-4.5.27.tar.gz | tar -xvz
+curl -s https://mirror.openshift.com/pub/openshift-v4/clients/ocp/4.5.27/openshift-install-linux-4.5.27.tar.gz | tar -xvz
+
+
+
+# here will be the OCP config located
+mkdir /root/ocp4
+cd /root/ocp4
+
+# main install config - customise if needed! - like IP addresses, hostPrefix, etc.....
+cat <<EOF > /root/ocp4/install-config.yaml
+apiVersion: v1
+baseDomain: ocp45.mydomain.com
+compute:
+- hyperthreading: Enabled
+  name: worker
+  replicas: 0
+controlPlane:
+  hyperthreading: Enabled
+  name: master
+  replicas: 3
+metadata:
+  name: ocp45
+networking:
+  clusterNetworks:
+  - cidr: 10.254.0.0/16
+    hostPrefix: 22
+  networkType: OpenShiftSDN
+  serviceNetwork:
+  - 172.30.0.0/16
+platform:
+  none: {}
+pullSecret: '$RHN_PULLSECRET'
+sshKey: '$(cat /root/.ssh/id_rsa.pub)'
+EOF
+
+
+# create install manifests
+openshift-install create manifests
+
+# disable scheduling on master nodes
+sed -i 's/mastersSchedulable: true/mastersSchedulable: false/' manifests/cluster-scheduler-02-config.yml
+
+# create ignition files
+openshift-install create ignition-configs
+
+# copy files to httpd server
+mkdir -p /var/www/html/{ignition,install}
+mv /root/rhcos-* /var/www/html/install
+cp ~/ocp4/*.ign /var/www/html/ignition/
+
+# change some access rights
+chmod +r -R /var/www/html/*
+chcon -R -t httpd_sys_content_t /var/www/html/
+
+
+
+######## start the installation ########
+
+# here you need to boot your bootstrap node
+# if successfully started (you see the login prompt), then you can start masters and workers
+# if all booted, you can disable PXE boot configs
+
+openshift-install wait-for bootstrap-complete --log-level debug
+
+# To monitor the progress:
+#     ssh -i /root/.ssh/id_rsa core@bootstrap.ocp45.mydomain.com
+#     journalctl -b -f -u release-image.service -u bootkube.service
+# at the end you can shut down bootstrap
+#     sudo halt -p
+
+# checking progress
+export KUBECONFIG=/root/ocp4/auth/kubeconfig
+oc get nodes
+oc get clusterversion
+
+# around "Working towards 4.5.27: 86% complete"
+# check & approve node certificates - 2x each additional nodes (6 nodes -> 12 certificate)
+
+oc get csr
+oc get csr -o go-template='{{range .items}}{{if not .status}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' | xargs oc adm certificate approve
+
+# ...wait a minute and again :)
+oc get csr -o go-template='{{range .items}}{{if not .status}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' | xargs oc adm certificate approve
+
+# ...and check again - each request need to be approved
+oc get csr
+
+
+
+######## enable dynamic storage provisioning with NFS ########
+cd /home/install
+
+git clone https://github.com/kubernetes-incubator/external-storage.git
+cd external-storage/nfs-client/deploy/
+
+oc project default
+
+sed '/\"create\", \"update", \"patch\"]/a\
+  - apiGroups: [\"\"]\
+    resources: [\"services\",\"endpoints\"]\
+    verbs: [\"get\"]\
+' rbac.yaml >> rbac-new.yaml
+
+oc create -f rbac-new.yaml
+oc adm policy add-scc-to-user hostmount-anyuid system:serviceaccount:default:nfs-client-provisioner
+
+sed 's/10.10.10.60/bastion.ocp45.mydomain.com/g' deployment.yaml > deployment-new.yaml
+sed -i 's/\/ifs\/kubernetes/\/storage\/pv_0001/g' deployment-new.yaml
+
+oc create -f deployment-new.yaml
+oc create -f class.yaml
+
+# checking it
+oc get pods -n default
+oc get deployment -n default
+oc get sc
+
+# this will be the default storageclass
+oc patch storageclass managed-nfs-storage -p '{"metadata": {"annotations": {"storageclass.kubernetes.io/is-default-class": "true"}}}'
+
+
+######## modify OpenShift registry to use default storageclass ########
+
+# modify registry to use storage
+oc patch configs.imageregistry.operator.openshift.io cluster --type merge --patch '{"spec":{"managementState":"Managed","rolloutStrategy":"Recreate","replicas":3,"storage":{"pvc":{"claim":""}}}}'
+
+# get an external route to registry
+oc patch configs.imageregistry.operator.openshift.io/cluster --patch '{"spec":{"defaultRoute":true}}' --type=merge
+
+
+
+######## wait to finish the installation ... ########
+openshift-install wait-for install-complete
+
+
+######## if succeed, you will see a similar message ########
+
+# INFO Install complete!
+# INFO To access the cluster as the system:admin user when using 'oc', run 'export KUBECONFIG=/root/ocp4/auth/kubeconfig'
+# INFO Access the OpenShift web-console here: https://console-openshift-console.apps.ocp45.mydomain.com
+# INFO Login to the console with user: "kubeadmin", and password: "AAAAA-bbbBB-CCCcc-ddddd"
+
+
+######### enable simple authentication ########
+
+# create password file
+htpasswd -bBc /root/ocp4/ocp4_password admin passw0rd
+htpasswd -bB /root/ocp4/ocp4_password developer developer
+
+# create secret
+oc create secret generic htpass-secret --from-file=htpasswd=/root/ocp4/ocp4_password -n openshift-config
+
+# create HTPasswd provider
+cat << EOF > /root/ocp4/htpasswd.yaml
+apiVersion: config.openshift.io/v1
+kind: OAuth
+metadata:
+  name: cluster
+spec:
+  identityProviders:
+  - name: my_htpasswd_provider
+    mappingMethod: claim
+    type: HTPasswd
+    htpasswd:
+      fileData:
+        name: htpass-secret
+EOF
+# and deploy it
+oc apply -f /root/ocp4/htpasswd.yaml
+
+# grant "cluster-admin" role to the new "admin" user
+oc adm policy add-cluster-role-to-user cluster-admin admin
+
+
+
+
+######## check again everything! ########
+oc get nodes
+oc get csr
+oc get clusterversion
+oc get co
+
+
+
+######## ENJOY YOUR OPENSHIFT ! :) ########

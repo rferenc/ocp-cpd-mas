@@ -1,0 +1,222 @@
+# Installation of Maximo Application Suite 8.3
+# ============================================================================================
+#
+# UNDER DEVELOPMENT !!!
+# CURRENT VERSION IS REALLY NOT RECOMMENDED FOR PRODUCTION !!!
+# use only for test purposes
+#
+# BAS installation need manual interactions :/
+
+
+######## installation parameters ########
+
+export ENTITLEMENT="my_entitlement_key_from_ibm"
+
+
+######## preparation ########
+
+mkdir -p /home/install/mas
+cd /home/install/mas
+
+yum -y install java-1.8.0-openjdk-headless unzip
+
+oc login --insecure-skip-tls-verify -u admin -p passw0rd https://api.ocp45.mydomain.com:6443
+
+
+
+######## MondoDB ########
+# based on https://github.com/ibm-watson-iot/iot-docs/blob/master/mongodb/README.md
+
+wget https://github.com/ibm-watson-iot/iot-docs/raw/master/mongodb/mongo-ce.zip
+unzip mongo-ce.zip
+cd mongo-ce
+
+# build docker image - if you already have it you can skip this part and continue with certificate
+yum -y install docker
+systemctl start docker.service
+docker build -t mongo-ce image/
+docker save mongo-ce:latest | gzip > mongo-ce_latest.tar.gz
+scp mongo-ce_latest.tar.gz user@10.0.0.2:/ftproot/ocp4/mas/
+
+
+# create a self signed certificate for mongo
+cd certificate/
+chmod +x generateSelfSignedCert.sh
+./generateSelfSignedCert.sh
+
+cd ..
+
+
+# upload mongo image to registry
+
+oc new-project mongo
+
+export KEYFILE_SECRET=$(echo "secret" | base64)
+export ADMIN_PASSWORD="password"
+export REGISTRY_ROUTE=default-route-openshift-image-registry.apps.ocp45.mydomain.com
+export REGISTRY_PULL_PREFIX=image-registry.openshift-image-registry.svc:5000
+export DOCKER_IMAGE="$REGISTRY_PULL_PREFIX/mongo/mongo-ce:latest"
+
+export INTERNAL_REG_SECRET=$(oc get sa default -o jsonpath='{.imagePullSecrets[*].name}')
+export REGISTRY_SECRET=$(oc get secret $INTERNAL_REG_SECRET -o jsonpath='{.data.\.dockercfg}')
+
+podman login --tls-verify=false -u $(oc whoami) -p $(oc whoami -t) $REGISTRY_ROUTE
+
+wget ftp://10.0.0.2/ocp4/mas/mongo-ce_latest.tar.gz
+podman load -i mongo-ce_latest.tar.gz
+
+podman tag mongo-ce $REGISTRY_ROUTE/mongo/mongo-ce:latest
+podman push --tls-verify=false $REGISTRY_ROUTE/mongo/mongo-ce:latest
+
+
+# use dynamic provisioned NFS storageclass :)
+sed -i "s/mongodbsc/managed-nfs-storage/" statefulset-template.yaml
+
+
+# deploy mongo
+envsubst < statefulset-template.yaml > statefulset.yaml
+
+oc create secret generic mongo-ca --from-file=certificate/mongodb.pem
+oc patch serviceaccount/default --type='json' -p='[{"op":"add","path":"/imagePullSecrets/-","value":{"name":"docker-secret"}}]'
+oc apply -f statefulset.yaml
+
+# oc create route passthrough --service mongo --port 27017
+
+# check service IP for MAS
+oc get svc
+
+
+
+
+######## Behavior Analytics Server ########
+# scripts and steps based on https://developer.ibm.com/openlabsdev/ui/behavior-analytics-services
+# recommended at https://www.ibm.com/support/knowledgecenter/SSRHPA_current/appsuite/install/dependencies/index.html#bas
+# need to fix :/
+
+mkdir -p /home/install/mas/bas
+cd /home/install/mas/bas
+
+curl -s ftp://10.0.0.2/ocp4/mas/bas_install.tgz | tar xvfz -
+
+./BAS_installation.sh
+
+# well this install is not working unfortunately, at step 6 it's stop
+# you need to delete BAS operator from OpenShift console and create a new one from OperatorHub
+# after you can continue with step 7 in the install file
+
+
+# Result:
+# ===========API KEY==============
+# dfghlihihILUHIUHILBFisudhgius375934875tfnk
+# ===========BAS Endpoint URL==============
+# https://bas-endpoint-mas-bas.apps.ocp45.mydomain.com
+
+
+
+# later to check these again if needed
+oc project mas-bas
+
+# Get connection details
+echo "API key: $(oc get secret bas-api-key --output="jsonpath={.data.apikey}" | base64 -d)"
+echo "BAS host: https://$(oc get routes bas-endpoint -n "${projectName}" |awk 'NR==2 {print $2}')"
+echo "Port: 443"
+
+
+
+######## Kafka with Strimzi ########
+
+mkdir -p /home/install/mas
+cd /home/install/mas
+
+oc create namespace strimzi
+oc project strimzi
+
+# get package
+wget https://github.com/strimzi/strimzi-kafka-operator/releases/download/0.21.1/strimzi-0.21.1.tar.gz
+gunzip strimzi-0.21.1.tar.gz
+tar -xvf strimzi-0.21.1.tar
+cd strimzi-0.21.1/
+
+# modify namespace in files
+sed -i 's/namespace: .*/namespace: strimzi/' install/cluster-operator/*RoleBinding*.yaml
+
+sed -i '/STRIMZI_NAMESPACE/{n;N;N;d}' install/cluster-operator/060-Deployment-strimzi-cluster-operator.yaml
+sed -i '/STRIMZI_NAMESPACE/a\
+              value: "strimzi"' install/cluster-operator/060-Deployment-strimzi-cluster-operator.yaml
+
+# add roles
+kubectl create clusterrolebinding strimzi-cluster-operator-namespaced --clusterrole=strimzi-cluster-operator-namespaced --serviceaccount strimzi:strimzi-cluster-operator
+kubectl create clusterrolebinding strimzi-cluster-operator-entity-operator-delegation --clusterrole=strimzi-entity-operator --serviceaccount strimzi:strimzi-cluster-operator
+kubectl create clusterrolebinding strimzi-cluster-operator-topic-operator-delegation --clusterrole=strimzi-topic-operator --serviceaccount strimzi:strimzi-cluster-operator
+
+# deploy operator
+kubectl apply -f install/cluster-operator -n strimzi
+
+
+# get kafka cluster definition
+cd /home/install/mas
+wget https://raw.githubusercontent.com/ibm-watson-iot/iot-docs/master/kafka/kafka-resources/mas-kafka-cluster.yaml
+
+# change storageclass and version
+sed -i 's/kafka-block-storage/managed-nfs-storage/' mas-kafka-cluster.yaml
+sed -i 's/version: 2.4.0/version: 2.7.0/' mas-kafka-cluster.yaml
+
+# deploy
+oc create -f mas-kafka-cluster.yaml
+
+# get user definition
+wget https://raw.githubusercontent.com/ibm-watson-iot/iot-docs/master/kafka/kafka-resources/mas-kafka-user.yaml
+
+# deploy
+oc create -f mas-kafka-user.yaml
+
+
+# get necessary info later for MAS
+
+oc project strimzi
+
+echo "Hosts: $(oc get pod maskafka-kafka-0 --template={{.status.podIP}}), $(oc get pod maskafka-kafka-1 --template={{.status.podIP}}), $(oc get pod maskafka-kafka-2 --template={{.status.podIP}})"
+echo "Port: 9093"
+echo "SASL Mechanism: scram-sha-512"
+echo "Username: mas-user"
+echo "Password: $(oc get secret mas-user --output="jsonpath={.data.password}" | base64 -d)"
+
+
+
+######## Certificate manager ########
+# in production we need to enhance this
+
+oc create namespace cert-manager
+oc project cert-manager
+oc apply -f https://github.com/jetstack/cert-manager/releases/download/v1.1.0/cert-manager.yaml
+
+
+######## Maximo Application Suite installation ########
+
+cd /home/install/mas
+
+# get the package from IBM Passport Advantage :)
+curl -s ftp://10.0.0.2/ocp4/mas/mas-installer-8.3.0.tgz | gunzip -c | tar xvfz -
+
+
+cd mas
+
+
+export ENTITLEMENT_KEY=$ENTITLEMENT
+export LICENSING_STORAGE_CLASS=managed-nfs-storage
+
+./install.sh -i mas --domain mas.apps.mydomain.com --accept-license -icn 112233 -cc hu -cn IBMCustomer
+# ICN is the IBM Customer Number (usually 6 digit) (112233 is not valid)
+# CC is the country code
+# CN is the customer name
+
+
+# when finished you will have something similar
+# ...
+# Super User Credentials
+# ----------------------------------------------------------------------
+#  - Username: dskfjgh94385z9843prehgp48u5t9384
+#  - Password: 95up934thp9348z598ztpiu4hp9t8998
+# ...
+# Sign in as the superuser at this URL:
+# https://admin.mas.apps.ocp45.mydomain.com/initialsetup
