@@ -205,7 +205,7 @@ cd /root/ocp4
 # main install config - customise if needed! - like IP addresses, hostPrefix, etc.....
 cat <<EOF > /root/ocp4/install-config.yaml
 apiVersion: v1
-baseDomain: ocp45.mydomain.com
+baseDomain: mydomain.com
 compute:
 - hyperthreading: Enabled
   name: worker
