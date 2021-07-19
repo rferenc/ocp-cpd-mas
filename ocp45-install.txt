@@ -1,16 +1,16 @@
-# Installation of Red Hat Openshift 4.5
+# Installation of Red Hat Openshift 4.5 (or even 4.6 / 4.7)
 # ============================================================================================
 
 # Environment:
 #
-# bastion          10.0.45.1      management linux, OS installed: Red Hat Enterprise Linux 7.5
-#                                 almost all commands executed here
-#                                 fix IP, 4 CPU, 32G mem, 256+1024G disk (2nd disk for NFS)
-# bootstrap        10.0.45.10     DHCP, PXE boot - CoreOS  8 CPU, 32G mem, 256G disk
-# 3 x master node  10.0.45.11-13  DHCP, PXE boot - CoreOS  8 CPU, 32G mem, 256G disk
-# 3+ x worker node 10.0.45.21-2x  DHCP, PXE boot - CoreOS  16 CPU, 64G mem, 256G disk
+# bastion             10.0.45.1      management linux, OS installed: Red Hat Enterprise Linux 7.5
+#                                    almost all commands executed here
+#                                    fix IP, 4 CPU, 32G mem, 256+1024G disk (2nd disk for NFS)
+# bootstrap           10.0.45.10     DHCP, PXE boot - CoreOS  8 CPU, 32G mem, 256G disk
+# 3 x master node     10.0.45.11-13  DHCP, PXE boot - CoreOS  8 CPU, 32G mem, 256G disk
+# 3+ x worker node    10.0.45.21-2x  DHCP, PXE boot - CoreOS  16 CPU, 64G mem, 256G disk
 #
-# DNS, DHCP, PXE server out of the scope, but some sample will be in the GIT repo
+# external DNS & NTP  10.0.0.2
 
 
 ######## installation parameters ########
@@ -36,6 +36,24 @@ hostnamectl set-hostname bastion.ocp45.mydomain.com
 nmcli con mod ens192 ipv4.dns-search "ocp45.mydomain.com"
 systemctl restart NetworkManager.service
 
+
+
+######## Red Hat access ########
+subscription-manager register --username $RHN_USERNAME --password $RHN_PASSWORD
+subscription-manager refresh
+
+subscription-manager list --available
+
+# you will need: "Red Hat OpenShift Container Platform" from above list
+subscription-manager attach --pool=11223344aaff5566
+
+subscription-manager repos --enable=rhel-7-server-extras-rpms
+
+
+# install some packages
+yum -y install net-tools haproxy wget httpd selinux-policy policycoreutils-python podman httpd-tools git bind-utils
+
+cd /root
 
 
 
@@ -87,26 +105,115 @@ systemctl start nfs
 
 
 
+######## configure DNSMasq for DHCP, TFTP, DNS ########
 
-######## change dhcp mac addresses if needed and active PXE tftpboot configs now for CoreOS nodes ########
+yum -y install dnsmasq syslinux
+
+mkdir -p /storage/tftpboot/pxelinux.cfg
+
+# default PXE config will be hard disk boot
+cat <<EOF >  /storage/tftpboot/pxelinux.cfg/default
+default menu.c32
+prompt 0
+timeout 300
+ONTIMEOUT local
+menu title ### PXE Boot Menu ###
+LABEL local
+  MENU LABEL Boot first disk
+  LOCALBOOT 0
+EOF
+
+# copy the PXE boot files
+cp /usr/share/syslinux/pxelinux.0 /storage/tftpboot/
+cp /usr/share/syslinux/menu.c32 /storage/tftpboot/
+cp /usr/share/syslinux/ldlinux.c32 /storage/tftpboot/
+
+mkdir /storage/tftpboot/images
+cd /storage/tftpboot/images
+
+# download the kernel and initrams files from: https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/
+wget ftp://10.107.0.2/ocp4/rhcos-4.5.6-x86_64-installer-kernel-x86_64
+wget ftp://10.107.0.2/ocp4/rhcos-4.5.6-x86_64-installer-initramfs.x86_64.img
+
+# wget https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/4.6/4.6.8/rhcos-4.6.8-x86_64-live-kernel-x86_64
+# wget https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/4.6/4.6.8/rhcos-4.6.8-x86_64-live-initramfs.x86_64.img
+
+# wget https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/4.7/4.7.13/rhcos-4.7.13-x86_64-live-kernel-x86_64
+# wget https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/4.7/4.7.13/rhcos-4.7.13-x86_64-live-initramfs.x86_64.img
 
 
-######## Red Hat access ########
-subscription-manager register --username $RHN_USERNAME --password $RHN_PASSWORD
-subscription-manager refresh
-
-subscription-manager list --available
-
-# you will need: "Red Hat OpenShift Container Platform" from above list
-subscription-manager attach --pool=11223344aaff5566
-
-subscription-manager repos --enable=rhel-7-server-extras-rpms
+cp /etc/dnsmasq.conf /etc/dnsmasq.conf.backup
 
 
-# install some packages
-yum -y install net-tools haproxy wget httpd selinux-policy policycoreutils-python podman httpd-tools git bind-utils
 
-cd /root
+cat <<EOF > /etc/dnsmasq.conf
+
+interface=lo,ens192
+bind-interfaces
+listen-address=127.0.0.1,10.0.45.1
+cache-size=1000
+resolv-file=/etc/resolv.dnsmasq
+no-poll
+
+# DNS part
+expand-hosts
+domain=ocp45.mydomain.com
+server=10.0.0.2
+address=/apps.ocp45.mydomain.com/10.0.45.1
+address=/api.ocp45.mydomain.com/10.0.45.1
+address=/api-int.ocp45.mydomain.com/10.0.45.1
+address=/etcd-0.ocp45.mydomain.com/10.0.45.11
+address=/etcd-1.ocp45.mydomain.com/10.0.45.12
+address=/etcd-2.ocp45.mydomain.com/10.0.45.13
+srv-host=_etcd-server-ssl._tcp.ocp45.mydomain.com,etcd-0.ocp45.mydomain.com,2380,0,10
+srv-host=_etcd-server-ssl._tcp.ocp45.mydomain.com,etcd-1.ocp45.mydomain.com,2380,0,10
+srv-host=_etcd-server-ssl._tcp.ocp45.mydomain.com,etcd-2.ocp45.mydomain.com,2380,0,10
+
+# DHCP part
+dhcp-range=10.0.45.1,10.0.45.100,12h
+dhcp-ignore=tag:!known
+dhcp-leasefile=/var/lib/dnsmasq/dnsmasq.leases
+dhcp-authoritative
+dhcp-option=option:dns-server,10.0.45.1
+dhcp-host=00:50:56:8b:00:01,bastion,10.0.45.1
+dhcp-host=00:50:56:8b:00:02,bootstrap,10.0.45.10
+dhcp-host=00:50:56:8b:00:03,compute-0,10.0.45.21
+dhcp-host=00:50:56:8b:00:04,compute-1,10.0.45.22
+dhcp-host=00:50:56:8b:00:05,compute-2,10.0.45.23
+dhcp-host=00:50:56:8b:00:06,control-0,10.0.45.11
+dhcp-host=00:50:56:8b:00:07,control-1,10.0.45.12
+dhcp-host=00:50:56:8b:00:08,control-2,10.0.45.13
+dhcp-boot=pxelinux.0,pxeserver,10.0.45.1    # PXE server
+dhcp-option=3,10.0.0.3                      # Gateway
+dhcp-option=42,10.0.0.2                     # NTP Server
+
+enable-tftp
+tftp-root=/storage/tftpboot
+
+log-facility=/var/log/dnsmasq.log
+
+EOF
+
+# !!!!!!!!!! change dhcp mac addresses !!!!!!!!!!
+
+# enable on firewall
+firewall-cmd --add-service=dns --permanent      ## Port 53
+firewall-cmd --add-service=dhcp --permanent     ## Port 67
+firewall-cmd --add-port=69/udp --permanent      ## Port for TFTP
+firewall-cmd --reload
+
+# some SELinux settings
+/usr/sbin/semanage fcontext -a -t tftpdir_t "/storage/tftpboot(/.*)?"
+/sbin/restorecon -R -v /storage/tftpboot
+
+# start service
+systemctl enable dnsmasq
+systemctl restart dnsmasq
+
+# replace external DNS to local
+sed -i "s/10.0.0.2/10.107.45.1/" /etc/resolv.conf   # replace nameserver to local
+
+
 
 ######## Configuring HAProxy ########
 wget https://raw.githubusercontent.com/openshift-tigerteam/guides/master/ocp4/ocp4-haproxy.cfg
@@ -187,14 +294,24 @@ ssh-keygen -N "" -f /root/.ssh/id_rsa
 
 # get install files
 
-# Latest: https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/latest/latest/
+# Latest: https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/
 wget https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/4.5/4.5.6/rhcos-4.5.6-x86_64-metal.x86_64.raw.gz
+
+# wget https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/4.6/4.6.8/rhcos-4.6.8-x86_64-live-rootfs.x86_64.img
+
+# wget https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/4.7/4.7.13/rhcos-4.7.13-x86_64-live-rootfs.x86_64.img
 
 cd /usr/local/bin/
 
-# Latest: https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/
+# Latest: https://mirror.openshift.com/pub/openshift-v4/clients/ocp/
 curl -s https://mirror.openshift.com/pub/openshift-v4/clients/ocp/4.5.27/openshift-client-linux-4.5.27.tar.gz | tar -xvz
 curl -s https://mirror.openshift.com/pub/openshift-v4/clients/ocp/4.5.27/openshift-install-linux-4.5.27.tar.gz | tar -xvz
+
+# curl -s https://mirror.openshift.com/pub/openshift-v4/clients/ocp/4.6.25/openshift-client-linux-4.6.25.tar.gz | tar -xvz
+# curl -s https://mirror.openshift.com/pub/openshift-v4/clients/ocp/4.6.25/openshift-install-linux-4.6.25.tar.gz | tar -xvz
+
+# https://mirror.openshift.com/pub/openshift-v4/clients/ocp/4.7.13/openshift-client-linux-4.7.13.tar.gz | tar -xvz
+# https://mirror.openshift.com/pub/openshift-v4/clients/ocp/4.7.13/openshift-install-linux-4.7.13.tar.gz | tar -xvz
 
 
 

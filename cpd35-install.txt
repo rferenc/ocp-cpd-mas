@@ -140,6 +140,50 @@ oc get pods -n ${NAMESPACE} -l name=ibm-cp-data-operator
 
 
 
+########  Portworx ######## 
+# https://www.ibm.com/docs/en/cloud-paks/cp-data/3.5.0?topic=storage-installing-portworx-essentials-cloud-pak-data
+
+oc project kube-system
+
+# you need to download Portworx from IBM Passport advantage
+tar -xvz cpdv3.5.0_portworx.tgz
+
+cd ./cpd-portworx/px-images
+export PODMAN_LOGIN_ARGS="--tls-verify=false"
+export PODMAN_PUSH_ARGS="--tls-verify=false"
+# be aware, that this will remove ALL local images!!!
+./podman-rm-local-images.sh
+# push images to registry
+./process-px-images.sh -r $(oc registry info -n openshift-image-registry) -u $(oc whoami) -p $(oc whoami -t) -s kube-system -c podman -t ./px_2.6.2.0-dist.tgz
+
+# checking imagestreams
+oc get imagestreams -n kube-system
+
+# compute-0, 1, 2 will have 1T (sdb) + 100G (sdc) raw storage attached
+oc label nodes compute-0 compute-1 compute-2 compute-3 compute-4 compute-5 px/metadata-node=true
+# other possibilities
+# oc label nodes compute-3 compute-4 compute-5 px/storageless=true
+# oc label nodes compute-3 compute-4 compute-5 px/enabled=false
+
+cd ../px-install-4.x
+./px-install.sh install-operator
+
+watch "oc get po -n kube-system"
+
+# install the cluster
+./px-install.sh install-storage /dev/sdb /dev/sdc
+
+# check the progress, wait for all pods run
+watch "oc get po -n kube-system"
+
+# checking Portworx cluster status
+PX_POD=$(kubectl get pods -l name=portworx -n kube-system -o jsonpath='{.items[0].metadata.name}')
+kubectl exec $PX_POD -n kube-system -- /opt/pwx/bin/pxctl status
+# You should see this message: "PX is operational"
+
+# adding storage classes
+./px-sc.sh
+
 
 
 ######## install Cloud Pak for Data packages ########
@@ -150,15 +194,18 @@ oc new-project cpd
 #
 # assembly keywords: https://github.com/IBM/cloud-pak/tree/master/repo/cpd/3.5/assembly
 #
-# 3.5.2
-#   lite  - core
-#   db2wh - DB2 Warehouse Edition
-#   dmc   - DB2 Data Management Console
-# 3.5.1
-#   wsl   - Watson Studio
-#   wml   - Watson Machine learning
-# 3.5.0
-#   mongodb - MongoDB Enterprise
+#   lite              - core
+#
+#   db2wh             - DB2 Warehouse Edition
+#   dmc               - DB2 Data Management Console
+#   mongodb           - MongoDB Enterprise
+#
+#   wsl               - Watson Studio
+#   wml               - Watson Machine learning
+#   watson-discovery  - Watson Discovery ** special install - pls see below
+#   dods              - Decision Optimization
+#   aiopenscale       - Watson OpenScale
+#   spss-modeler      - SPSS Modeler
 
 
 # to download from internet:
@@ -177,10 +224,10 @@ curl -s ftp://10.0.0.2/ocp4/cpd/cpd-cli-lite-workspace-3.5.2.tar.xy | tar -xvJ
 
 
 # check needed security context, RBAC, roles, etc.
-./cpd-cli adm --repo ./repo.yaml --arch x86_64 --namespace cpd --accept-all-licenses --assembly lite
+./cpd-cli adm --arch x86_64 --namespace cpd --load-from /storage/install/cpd/cpd-cli-workspace --latest-dependency --accept-all-licenses --assembly lite
 
 # and apply
-./cpd-cli adm --repo ./repo.yaml --arch x86_64 --namespace cpd --accept-all-licenses --assembly lite --apply
+./cpd-cli adm --arch x86_64 --namespace cpd --load-from /storage/install/cpd/cpd-cli-workspace --latest-dependency --accept-all-licenses --assembly lite --apply
 
 
 # load images to registry
@@ -190,14 +237,42 @@ curl -s ftp://10.0.0.2/ocp4/cpd/cpd-cli-lite-workspace-3.5.2.tar.xy | tar -xvJ
 
 
 # dry run
-./cpd-cli install --arch x86_64 --namespace cpd --storageclass managed-nfs-storage \
---insecure-skip-tls-verify --cluster-pull-prefix image-registry.openshift-image-registry.svc:5000/cpd \
---load-from /home/install/cpd/cpd-cli-workspace --latest-dependency --accept-all-licenses --dry-run --assembly lite
+./cpd-cli preload-images --arch x86_64 --action push --load-from /storage/install/cpd/cpd-cli-workspace \
+  --insecure-skip-tls-verify --target-registry-username $(oc whoami) --target-registry-password $(oc whoami -t) \
+  --transfer-image-to $(oc registry info)/cpd --accept-all-licenses --assembly lite
+
+# if there is an error message, that this modul don't have Portworx override, then pls remove the "--override-config portworx" part
+
 
 # and install
 ./cpd-cli install --arch x86_64 --namespace cpd --storageclass managed-nfs-storage \
---insecure-skip-tls-verify --cluster-pull-prefix image-registry.openshift-image-registry.svc:5000/cpd \
---load-from /home/install/cpd/cpd-cli-workspace --latest-dependency --accept-all-licenses --verbose --assembly lite
+--insecure-skip-tls-verify --cluster-pull-prefix $(oc registry info --internal)/cpd \
+--load-from /storage/install/cpd/cpd-cli-workspace --latest-dependency --accept-all-licenses --override-config portworx --verbose --assembly lite
+
+
+
+# *** only for Watson discovery, last two step looks like - to install simply remove the "--dry-run" ***
+
+./cpd-cli install \
+  --assembly edb-operator \
+  --optional-modules edb-pg-base:x86_64 \
+  --arch x86_64  \
+  --namespace cpd  \
+  --storageclass managed-nfs-storage \
+  --insecure-skip-tls-verify --cluster-pull-prefix $(oc registry info --internal)/cpd \
+  --load-from /storage/install/cpd/cpd-cli-workspace  \
+  --latest-dependency --accept-all-licenses --dry-run
+
+./cpd-cli install \
+  --assembly watson-discovery  \
+  --arch x86_64  \
+  --namespace cpd  \
+  --storageclass portworx-db-gp3-sc \
+  --insecure-skip-tls-verify --cluster-pull-prefix $(oc registry info --internal)/cpd \
+  --load-from /storage/install/cpd/cpd-cli-workspace  \
+  --latest-dependency --accept-all-licenses --dry-run 
+
+  # *** Watson discovery END ***
 
 
 
