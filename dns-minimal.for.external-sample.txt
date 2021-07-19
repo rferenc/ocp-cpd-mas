@@ -1,0 +1,2 @@
+bastion.ocp45   IN      A       10.0.45.1
+*.apps.ocp45    IN      A       10.0.45.1
