@@ -1,0 +1,451 @@
+
+### Environment ###
+echo "LANG=en_US.utf-8" >> /etc/environment
+echo "LC_ALL=en_US.utf-8" >> /etc/environment
+
+
+
+### Network setup ###
+
+nmcli con mod ens192 ipv4.addresses "192.168.47.1/16"
+nmcli con mod ens192 ipv4.gateway "192.168.0.3"
+nmcli con mod ens192 ipv4.dns "192.168.0.2"
+nmcli con mod ens192 ipv4.dns-search "ocp47.mydomain.com"
+nmcli con mod ens192 ipv4.method manual
+
+hostnamectl set-hostname bastion.ocp47.mydomain.com
+
+systemctl restart NetworkManager.service
+
+
+
+### RHEL subscription ###
+
+subscription-manager register --username rhusername --password 'rhpassword'
+subscription-manager refresh
+
+subscription-manager list --available
+
+# you will need: Red Hat OpenShift Container Platform
+subscription-manager attach --pool=aaabbbccc111222333
+
+# subscription-manager repos --list
+subscription-manager repos --enable=rhel-7-server-extras-rpms
+# subscription-manager repos --enable=rhel-8-server-extras-rpms
+
+# yum -y update
+
+yum -y install net-tools haproxy wget httpd selinux-policy podman httpd-tools git bind-utils
+
+#RHEL 7
+yum -y install policycoreutils-python
+#RHEL 8
+yum -y install policycoreutils-python-utils
+
+
+
+### NFS server ###
+# bastion node have a second disk
+
+# create persistent volume, volume group and logical volume
+pvcreate /dev/sdb
+vgcreate storage /dev/sdb
+lvcreate -l 100%FREE -n nfs storage
+
+# format with XFS filesystem
+mkfs.xfs /dev/mapper/storage-nfs
+
+# add to fstab
+echo "/dev/mapper/storage-nfs /storage                xfs     defaults        0 0" >> /etc/fstab
+
+mkdir /storage
+mount /storage
+
+# install packages
+yum -y install nfs-utils
+
+# RHEL 7 - enable service(s)
+systemctl enable rpcbind
+systemctl enable nfs-lock
+systemctl enable nfs
+
+# RHEL 7 enable service(s)
+systemctl enable rpcbind
+systemctl enable nfs-server
+
+# enable on firewall
+firewall-cmd --permanent --add-service=nfs
+firewall-cmd --reload
+
+# create some folder with proper access
+cd /storage
+mkdir shares
+cd shares
+
+mkdir pv_0001
+mkdir pv_0002
+mkdir pv_0003
+chown nfsnobody:nfsnobody pv_000*
+chmod 777 pv_000*
+
+# create the exports file
+cat <<EOF > /etc/exports.d/openshift.exports
+/storage/shares/pv_0001 *(rw,no_root_squash,no_wdelay)
+/storage/shares/pv_0002 *(rw,no_root_squash,no_wdelay)
+/storage/shares/pv_0003 *(rw,no_root_squash,no_wdelay)
+EOF
+
+# RHEL 7 - start service(s)
+systemctl start rpcbind
+systemctl start nfs-lock
+systemctl start nfs
+
+# RHEL 8 - start service(s)
+systemctl start rpcbind
+systemctl start nfs-server
+
+
+
+### HAproxy ###
+
+wget https://raw.githubusercontent.com/openshift-tigerteam/guides/master/ocp4/ocp4-haproxy.cfg
+
+# enable automatic stat refresh
+sed -i '/stats enable/a\
+    stats refresh 10s' ocp4-haproxy.cfg
+
+# bootstrap
+sed -i 's/192.168.1.96/192.168.47.10/' ocp4-haproxy.cfg
+
+# masters
+sed -i 's/master/control-/' ocp4-haproxy.cfg
+sed -i 's/192.168.1.97/192.168.47.11/' ocp4-haproxy.cfg
+sed -i 's/192.168.1.98/192.168.47.12/' ocp4-haproxy.cfg
+sed -i 's/192.168.1.99/192.168.47.13/' ocp4-haproxy.cfg
+
+# workers
+sed -i 's/worker/compute-/' ocp4-haproxy.cfg
+sed -i 's/192.168.1.11/192.168.47.21/' ocp4-haproxy.cfg
+sed -i 's/192.168.1.7/192.168.47.22/' ocp4-haproxy.cfg
+
+# additional workers :)
+sed -i '/server compute-1 192.168.47.22:80 check/a\
+    server compute-2 192.168.47.23:80 check\
+    server compute-3 192.168.47.24:80 check\
+    server compute-4 192.168.47.25:80 check\
+    server compute-5 192.168.47.26:80 check' ocp4-haproxy.cfg
+sed -i '/server compute-1 192.168.47.22:443 check/a\
+    server compute-2 192.168.47.23:443 check\
+    server compute-3 192.168.47.24:443 check\
+    server compute-4 192.168.47.25:443 check\
+    server compute-5 192.168.47.26:443 check' ocp4-haproxy.cfg
+
+# change timeout for Cloud Pak for Data
+sed -i -e "/timeout client/s/ [0-9].*/ 5m/" ocp4-haproxy.cfg
+sed -i -e "/timeout server/s/ [0-9].*/ 5m/" ocp4-haproxy.cfg
+
+# activate config
+mv -f ocp4-haproxy.cfg /etc/haproxy/haproxy.cfg
+
+# SELinux settings
+setsebool -P haproxy_connect_any=1
+semanage permissive -a haproxy_t
+
+# enable and start service(s)
+systemctl enable haproxy
+systemctl start haproxy
+
+# enable on firewall
+firewall-cmd --zone=public --add-port=80/tcp --permanent
+firewall-cmd --zone=public --add-port=443/tcp --permanent
+firewall-cmd --zone=public --add-port=22623/tcp --permanent
+firewall-cmd --zone=public --add-port=9000/tcp --permanent
+firewall-cmd --zone=public --add-port=6443/tcp --permanent
+firewall-cmd --reload
+
+
+
+### HTTPd ###
+
+# change the port
+sed -i 's/Listen 80/Listen 8080/' /etc/httpd/conf/httpd.conf
+
+# create some folders
+mkdir -p /var/www/html/{ignition,install}
+
+# enable and start service (s)
+systemctl enable httpd
+systemctl start httpd
+
+# enable on firewall
+firewall-cmd --zone=public --add-port=8080/tcp --permanent
+firewall-cmd --reload
+
+
+
+### DNSMasq, PXE, tftp ###
+
+# install packages
+yum -y install dnsmasq syslinux
+
+mkdir -p /storage/tftpboot/pxelinux.cfg
+
+# create a default config
+cat <<EOF >  /storage/tftpboot/pxelinux.cfg/default
+default menu.c32
+prompt 0
+timeout 300
+ONTIMEOUT local
+menu title ### PXE Boot Menu ###
+LABEL local
+  MENU LABEL Boot first disk
+  LOCALBOOT 0
+EOF
+
+# copy some files (both for RH7 and RH8 - if missing, then skip it)
+cp /usr/share/syslinux/pxelinux.0 /storage/tftpboot/
+cp /usr/share/syslinux/menu.c32 /storage/tftpboot/
+cp /usr/share/syslinux/ldlinux.c32 /storage/tftpboot/
+cp /usr/share/syslinux/libutil.c32 /storage/tftpboot/
+
+
+mkdir /storage/tftpboot/images
+cd /storage/tftpboot/images
+
+# download the RH CoreOS files
+wget https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/4.7/4.7.13/rhcos-4.7.13-x86_64-live-kernel-x86_64
+wget https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/4.7/4.7.13/rhcos-4.7.13-x86_64-live-initramfs.x86_64.img
+
+# backup old config config
+cp /etc/dnsmasq.conf /etc/dnsmasq.conf.backup
+
+# and create a new
+cat <<EOF > /etc/dnsmasq.conf
+
+interface=lo,ens192
+bind-interfaces
+listen-address=127.0.0.1,192.168.47.1
+cache-size=1000
+resolv-file=/etc/resolv.dnsmasq
+no-poll
+
+expand-hosts
+domain=ocp47.mydomain.com
+server=192.168.0.2
+address=/bastion.ocp47.mydomain.com/192.168.47.1
+address=/apps.ocp47.mydomain.com/192.168.47.1
+address=/api.ocp47.mydomain.com/192.168.47.1
+address=/api-int.ocp47.mydomain.com/192.168.47.1
+address=/etcd-0.ocp47.mydomain.com/192.168.47.11
+address=/etcd-1.ocp47.mydomain.com/192.168.47.12
+address=/etcd-2.ocp47.mydomain.com/192.168.47.13
+srv-host=_etcd-server-ssl._tcp.ocp47.mydomain.com,etcd-0.ocp47.mydomain.com,2380,0,10
+srv-host=_etcd-server-ssl._tcp.ocp47.mydomain.com,etcd-1.ocp47.mydomain.com,2380,0,10
+srv-host=_etcd-server-ssl._tcp.ocp47.mydomain.com,etcd-2.ocp47.mydomain.com,2380,0,10
+
+dhcp-range=192.168.47.1,192.168.47.100,12h
+dhcp-ignore=tag:!known
+dhcp-leasefile=/var/lib/dnsmasq/dnsmasq.leases
+dhcp-authoritative
+dhcp-option=option:dns-server,192.168.47.1
+dhcp-host=00:50:56:8b:e0:d5,bastion,192.168.47.1
+dhcp-host=00:50:56:8b:d2:12,bootstrap,192.168.47.10
+dhcp-host=00:50:56:8b:61:e7,compute-0,192.168.47.21
+dhcp-host=00:50:56:8b:37:70,compute-1,192.168.47.22
+dhcp-host=00:50:56:8b:36:4a,compute-2,192.168.47.23
+dhcp-host=00:50:56:8b:f0:b4,control-0,192.168.47.11
+dhcp-host=00:50:56:8b:fb:1c,control-1,192.168.47.12
+dhcp-host=00:50:56:8b:9e:ab,control-2,192.168.47.13
+dhcp-boot=pxelinux.0,pxeserver,192.168.47.1
+
+# Gateway
+dhcp-option=3,192.168.0.3
+# NTP Server
+dhcp-option=42,192.168.0.2
+
+enable-tftp
+tftp-root=/storage/tftpboot
+
+log-facility=/var/log/dnsmasq.log
+
+EOF
+
+# enable on firewall
+firewall-cmd --add-service=dns --permanent      ## Port 53
+firewall-cmd --add-service=dhcp --permanent     ## Port 67
+firewall-cmd --add-port=69/udp --permanent      ## Port for TFTP
+firewall-cmd --reload
+
+# SELinux settings
+/usr/sbin/semanage fcontext -a -t tftpdir_t "/storage/tftpboot(/.*)?"
+/sbin/restorecon -R -v /storage/tftpboot
+
+# enable and restart service(s)
+systemctl enable dnsmasq
+systemctl restart dnsmasq
+
+# cat <<EOF >> /etc/resolv.conf
+# nameserver 192.168.47.1
+# EOF
+
+ # replace nameserver to local
+ sed -i "s/192.168.0.2/192.168.47.1/" /etc/resolv.conf
+
+
+
+###    PXE RHCOS 4.7 version
+
+cd /storage/tftpboot/pxelinux.cfg
+
+# convert IP addresses to hexa:
+#     192 - C0
+#     168 - A8
+#     47  - 2F
+#     0A  - 10
+
+# remove old if exists
+rm -rf C0A82F*
+
+# create for bootstrap
+cat <<EOF >  C06B2F0A
+DEFAULT pxeboot
+TIMEOUT 20
+PROMPT 0
+LABEL pxeboot
+    KERNEL images/rhcos-4.7.13-x86_64-live-kernel-x86_64
+    APPEND initrd=images/rhcos-4.7.13-x86_64-live-initramfs.x86_64.img coreos.live.rootfs_url=http://192.168.47.1:8080/install/rhcos-4.7.13-x86_64-live-rootfs.x86_64.img coreos.inst.install_dev=/dev/sda coreos.inst.ignition_url=http://192.168.47.1:8080/ignition/bootstrap.ign
+EOF
+
+# copy to master
+cp C06B2F0A C06B2F0B
+
+# replace IGN to master
+sed -i "s/bootstrap.ign/master.ign/" C06B2F0B
+
+# copy to other masters
+cp C06B2F0B C06B2F0C
+cp C06B2F0B C06B2F0D
+
+# copy to worker
+cp C06B2F0A C06B2F15
+
+# replace IGN to worker
+sed -i "s/bootstrap.ign/worker.ign/" 0A6B2F15
+
+# copy to other worker(s)
+cp 0A6B2F15 0A6B2F16
+cp 0A6B2F15 0A6B2F17
+
+
+
+### Openshift installation ###
+
+cd /root
+
+# create a new ssh key
+ssh-keygen -N "" -f /root/.ssh/id_rsa
+
+cd /usr/local/bin/
+
+# download Openshift install and client
+# you can get the latest from https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/
+curl -s https://mirror.openshift.com/pub/openshift-v4/clients/ocp/4.7.13/openshift-client-linux-4.7.13.tar.gz | tar -xvz
+curl -s https://mirror.openshift.com/pub/openshift-v4/clients/ocp/4.7.13/openshift-install-linux-4.7.13.tar.gz | tar -xvz
+
+# Openshift initial config will be created here
+mkdir /root/ocp4
+cd /root/ocp4
+
+# you need to prepare "/root/pullsecret.txt" file with your Pull Secret from
+#    https://cloud.redhat.com/openshift/install/metal/user-provisioned
+
+# create a cluster config file - baseDomain and metadata.name can be changed
+cat <<EOF > install-config.yaml
+apiVersion: v1
+baseDomain: mydomain.com
+compute:
+- hyperthreading: Enabled
+  name: worker
+  replicas: 0
+controlPlane:
+  hyperthreading: Enabled
+  name: master
+  replicas: 3
+metadata:
+  name: ocp47
+networking:
+  clusterNetworks:
+  - cidr: 10.254.0.0/16
+    hostPrefix: 22
+  networkType: OpenShiftSDN
+  serviceNetwork:
+  - 172.30.0.0/16
+platform:
+  none: {}
+pullSecret: '$(cat /root/pullsecret.txt)'
+EOF
+
+# create the manifest files
+openshift-install create manifests
+
+# disable master scheduling
+sed -i 's/mastersSchedulable: true/mastersSchedulable: false/' manifests/cluster-scheduler-02-config.yml
+
+# create ignition files
+openshift-install create ignition-configs
+
+
+
+# download CoreOS rootfs component
+# https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/latest/latest/
+wget -P /var/www/html/install  https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/4.7/4.7.13/rhcos-4.7.13-x86_64-live-rootfs.x86_64.img
+
+# copy the ignition files
+cp ~/ocp4/*.ign /var/www/html/ignition/
+
+# change access
+chmod +r -R /var/www/html/*
+
+# and SELinux settins
+chcon -R -t httpd_sys_content_t /var/www/html/
+
+# boot your bootstrap, master and worker nodes
+
+# wait to install
+openshift-install wait-for bootstrap-complete --log-level debug
+
+# or monitor the bootstarp progress:
+# ssh -i /root/.ssh/id_rsa core@bootstrap
+# journalctl -b -f -u release-image.service -u bootkube.service
+# you need to see a "bootstarp.complete" message - after that node can be shut down
+
+# activate access
+export KUBECONFIG=/root/ocp4/auth/kubeconfig
+
+# check nodes and install progress
+oc get nodes
+oc get clusterversion
+
+# around Working towards 4.7.13: 93% complete
+# check & approve node certificates - 2x each additional nodes (6 nodes -> 12 certificate)
+
+# check
+oc get csr
+
+# approve
+oc get csr -o go-template='{{range .items}}{{if not .status}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' | xargs oc adm certificate approve
+
+# wait a minute and again :)
+oc get csr -o go-template='{{range .items}}{{if not .status}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' | xargs oc adm certificate approve
+
+
+# wait to finish...
+openshift-install wait-for install-complete
+
+
+# final checks
+oc get nodes
+oc get csr
+oc get clusterversion
+oc get co
+oc get mcp

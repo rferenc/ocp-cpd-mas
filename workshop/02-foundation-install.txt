@@ -1,0 +1,498 @@
+
+
+# activate Openshift installer access
+export KUBECONFIG=/root/ocp4/auth/kubeconfig
+
+
+
+### NFS Storage ######################################################
+
+# create work folder
+mkdir -p /storage/install/nfs
+cd /storage/install/nfs
+
+# clone the repo
+git clone https://github.com/kubernetes-incubator/external-storage.git
+cd external-storage/nfs-client/deploy/
+
+# create namespace yaml
+cat <<EOF > openshift-nfs-storage.yaml
+kind: Namespace
+apiVersion: v1
+metadata:
+  name: "openshift-nfs-storage"
+  labels:
+    name: "openshift-nfs-storage"
+EOF
+
+# create and switch namespace
+oc create -f openshift-nfs-storage.yaml
+oc project openshift-nfs-storage
+
+# modify rbac.yaml
+sed '/\"create\", \"update", \"patch\"]/a\
+  - apiGroups: [\"\"]\
+    resources: [\"services\",\"endpoints\"]\
+    verbs: [\"get\"]\
+' rbac.yaml >> rbac-new.yaml
+sed -i 's/default/openshift-nfs-storage/g' rbac-new.yaml
+
+# create it and define RBAC
+oc create -f rbac-new.yaml
+oc adm policy add-scc-to-user hostmount-anyuid system:serviceaccount:openshift-nfs-storage:nfs-client-provisioner
+
+# modify and create deployment.yaml - host, share and namespace
+sed 's/10.10.10.60/bastion.ocp47.mydomain.com/g' deployment.yaml > deployment-new.yaml
+sed -i 's/\/ifs\/kubernetes/\/storage\/shares\/pv_0001/g' deployment-new.yaml
+sed -i 's/default/openshift-nfs-storage/g' deployment-new.yaml
+
+oc create -f deployment-new.yaml
+
+# create storage class(es)
+oc create -f class.yaml
+
+# check pod's status
+oc get all -n openshift-nfs-storage
+
+# check storage classes
+oc get sc
+
+# make to default
+oc patch storageclass managed-nfs-storage -p '{"metadata": {"annotations": {"storageclass.kubernetes.io/is-default-class": "true"}}}'
+
+
+
+### CA & certs ######################################################
+
+# create work folder
+mkdir -p /storage/install/certificates
+cd /storage/install/certificates
+
+# Generating Diffie–Hellman key exchange file
+openssl dhparam -out dhparam-2048.pem 2048 > /dev/null 2>&1 &
+
+# CA private key
+openssl genrsa -out ca.key 4096
+
+# CA certificate
+openssl req -x509 -new -nodes -key ca.key -sha256 -days 36500 -out ca.crt -subj "/CN=Global CA"
+
+# Add ca.crt to you browser to trust the pillars.
+# For Chrome add into system trusted root CAs, for Firefox add it in its settings: about:preferences#privacy
+# This enables you to save passwords in browser and eliminate untrusted certificates related browser issues.
+
+# Trust CA in system
+cp ca.crt /etc/pki/ca-trust/source/anchors/
+update-ca-trust
+
+# Create public key for Bastion
+openssl genrsa -out bastion.key 2048
+
+# Create certificate request
+openssl req -new -sha256 -key bastion.key -out bastion.csr  \
+    -subj "/CN=bastion"  \
+    -reqexts SAN -config <(cat /etc/pki/tls/openssl.cnf \
+        <(printf "\n[SAN]\nsubjectAltName=DNS:bastion.ocp47.mydomain.com"))
+
+# Create signed crt
+openssl x509 -req  -days 36500 -in bastion.csr -out bastion.crt -CA ca.crt -CAkey ca.key -CAcreateserial   \
+    -extfile <(printf "subjectAltName=DNS:bastion.ocp47.mydomain.com")
+
+# Create public key for Openshift
+openssl genrsa -out ocp.key 2048
+
+# Create certificate request
+openssl req -new -sha256 -key ocp.key -out ocp.csr  \
+    -subj "/CN=ocp"  \
+    -reqexts SAN -config <(cat /etc/pki/tls/openssl.cnf \
+        <(printf "\n[SAN]\nsubjectAltName=DNS:*.apps.ocp47.mydomain.com"))
+
+# Create signed crt
+openssl x509 -req -days 36500 -in ocp.csr  -out ocp.crt -CA ca.crt -CAkey ca.key -CAserial ca.srl \
+    -extfile <(printf "subjectAltName=DNS:*.apps.ocp47.mydomain.com")
+
+
+# Create config map with Global CA crt
+oc create configmap global-ca --from-file=ca-bundle.crt=ca.crt -n openshift-config
+
+# Update proxy with Global CA config map
+oc patch proxy/cluster --type=merge --patch='{"spec":{"trustedCA":{"name":"global-ca"}}}'
+
+# !!!!! All Nodes will restart. Wait for them to complete. You can observe their status using
+# watch oc get nodes
+
+# Create secret with generate TLS
+oc create secret tls custom-ingress --cert=ocp.crt --key=ocp.key -n openshift-ingress
+
+# Update ingress to use new TLS
+oc patch ingresscontroller.operator default --type=merge -p '{"spec":{"defaultCertificate": {"name": "custom-ingress"}}}' -n openshift-ingress-operator
+# Routers and some other pods will restart/update
+
+
+
+### HTPasswd ######################################################
+
+# create a password file and add users
+htpasswd -bBc /root/ocp4/ocp4_password admin passw0rd
+htpasswd -bB /root/ocp4/ocp4_password developer developer
+
+# create a secret based on the file
+oc create secret generic htpass-secret --from-file=htpasswd=/root/ocp4/ocp4_password -n openshift-config
+
+# define a simple authentication with HTPasswd
+cat << EOF > /root/ocp4/htpasswd.yaml
+apiVersion: config.openshift.io/v1
+kind: OAuth
+metadata:
+  name: cluster
+spec:
+  identityProviders:
+  - name: Simple provider
+    mappingMethod: claim
+    type: HTPasswd
+    htpasswd:
+      fileData:
+        name: htpass-secret
+EOF
+
+# create it
+oc apply -f /root/ocp4/htpasswd.yaml
+
+# grant cluster admin access to the new "admin" user
+oc adm policy add-cluster-role-to-user cluster-admin admin
+
+
+
+### Login via OAuth ######################################################
+
+oc login --insecure-skip-tls-verify -u admin -p passw0rd https://api.ocp47.mydomain.com:6443
+
+
+
+### LDAP auth ######################################################
+
+# create work folder(s)
+mkdir -p /storage/install/openldap/{database,config,ldifs,certs}
+cd /storage/install/openldap
+
+# enable LDAP ports on firewall
+firewall-cmd --add-port=389/tcp --permanent
+firewall-cmd --add-port=636/tcp --permanent
+firewall-cmd --reload
+
+# copy the certificates
+cp /storage/install/certificates/bastion.crt certs/ldap.crt
+cp /storage/install/certificates/bastion.key certs/ldap.key
+cp /storage/install/certificates/ca.crt certs/ca.crt
+cp /storage/install/certificates/dhparam-2048.pem certs/dhparam.pem
+
+# run an OpenLDAP container
+podman run \
+    -p 389:389 \
+    -p 636:636 \
+	  --env LDAP_ORGANISATION="My Company" \
+	  --env LDAP_DOMAIN="ocp47.local" \
+	  --env LDAP_ADMIN_PASSWORD="passw0rd" \
+    --volume /storage/install/openldap/database:/var/lib/ldap:z \
+	  --volume /storage/install/openldap/config:/etc/ldap/slapd.d:z \
+    --volume /storage/install/openldap/ldifs:/container/service/slapd/assets/custom:z \
+    --volume /storage/install/openldap/certs:/container/service/slapd/assets/certs:z \
+    --env LDAP_TLS_CRT_FILENAME=ldap.crt \
+    --env LDAP_TLS_KEY_FILENAME=ldap.key \
+    --env LDAP_TLS_CA_CRT_FILENAME=ca.crt \
+    --name my-openldap-container \
+	  --detach \
+    docker.io/osixia/openldap:1.5.0
+
+# simple search as test
+podman exec my-openldap-container ldapsearch -x -H ldap://localhost -b dc=ocp47,dc=local -D "cn=admin,dc=ocp47,dc=local" -w passw0rd
+
+# create a password hash
+export PWHASH=$(podman exec my-openldap-container slappasswd -h {SSHA} -s passw0rd)
+
+# define groups and users
+cat << EOF > ldifs/ocp_users.ldif
+
+dn: ou=People,dc=ocp47,dc=local
+objectClass: organizationalUnit
+ou: People
+
+dn: ou=Group,dc=ocp47,dc=local
+objectClass: organizationalUnit
+ou: Group
+
+dn: uid=ocp1,ou=People,dc=ocp47,dc=local
+objectClass: top
+objectClass: account
+objectClass: posixAccount
+cn: ocp1
+uid: ocp1
+uidNumber: 1
+gidNumber: 100
+homeDirectory: /dev/null
+userPassword: $PWHASH
+
+dn: uid=ocp2,ou=People,dc=ocp47,dc=local
+objectClass: top
+objectClass: account
+objectClass: posixAccount
+cn: ocp2
+uid: ocp2
+uidNumber: 2
+gidNumber: 100
+homeDirectory: /dev/null
+userPassword: $PWHASH
+
+dn: uid=ocp3,ou=People,dc=ocp47,dc=local
+objectClass: top
+objectClass: account
+objectClass: posixAccount
+cn: ocp3
+uid: ocp3
+uidNumber: 3
+gidNumber: 100
+homeDirectory: /dev/null
+userPassword: $PWHASH
+
+EOF
+
+# add to LDAP
+podman exec my-openldap-container ldapadd -x -w passw0rd -D "cn=admin,dc=ocp47,dc=local" -f /container/service/slapd/assets/custom/ocp_users.ldif
+
+# test search "ocp1" user
+podman exec my-openldap-container ldapsearch -x -H ldap://localhost -b dc=ocp47,dc=local -D "cn=admin,dc=ocp47,dc=local" -w passw0rd "(&(objectClass=*)(uid=ocp1))"
+
+# define bind secret
+oc create secret generic ldap-bind-secret --from-literal=bindPassword=passw0rd -n openshift-config
+
+# create authentication config both for HTPasswd and LDAP
+cat << EOF > /root/ocp4/htpasswd_openldap.yaml
+apiVersion: config.openshift.io/v1
+kind: OAuth
+metadata:
+  name: cluster
+spec:
+  identityProviders:
+  - name: Simple provider
+    mappingMethod: claim
+    type: HTPasswd
+    htpasswd:
+      fileData:
+        name: htpass-secret
+  - name: Enterprise provider
+    mappingMethod: claim
+    type: LDAP
+    ldap:
+      attributes:
+        id:
+        - dn
+        email:
+        - mail
+        name:
+        - cn
+        preferredUsername:
+        - uid
+      insecure: true
+      bindDN: 'cn=admin,dc=ocp47,dc=local'
+      bindPassword:
+        name: ldap-bind-secret
+      url: "ldap://bastion.ocp47.mydomain.com/ou=People,dc=ocp47,dc=local?uid"
+EOF
+
+# apply it
+oc apply -f /root/ocp4/htpasswd_openldap.yaml
+
+
+
+### Login via OAuth ######################################################
+# now you can logon with both providers via the console
+# https://console-openshift-console.apps.ocp47.mydomain.com
+
+
+
+### Internal regsitry ######################################################
+
+# modify internal registry
+oc patch configs.imageregistry.operator.openshift.io/cluster --type merge --patch '{"spec":{"defaultRoute":true,"managementState":"Managed","rolloutStrategy":"Recreate","replicas":3,"storage":{"pvc":{"claim":""}}}}'
+
+# some pods will restart, you can monitor it with
+# watch oc get all -n openshift-image-registry
+
+# check URLs
+oc registry info
+oc registry info --internal
+
+
+
+### External regsitry ######################################################
+
+# create work folder(s)
+mkdir -p /storage/install/registry/{auth,certs,data}
+cd /storage/install/registry
+
+# create a simple password file
+htpasswd -bBc auth/htpasswd regadmin passw0rd
+
+# copy certificates
+cp /storage/install/certificates/bastion.crt certs/reg.crt
+cp /storage/install/certificates/bastion.key certs/reg.key
+cp /storage/install/certificates/ca.crt certs/ca.crt
+cp /storage/install/certificates/dhparam-2048.pem certs/dhparam.pem
+
+# enable on firewall
+firewall-cmd --add-port=5000/tcp --permanent
+firewall-cmd --reload
+
+# run in a container
+podman run \
+  -p 5000:5000 \
+  -v /storage/install/registry/auth:/auth:z \
+  -v /storage/install/registry/certs:/certs:z \
+  -v /storage/install/registry/data:/var/lib/registry:z \
+  -e "REGISTRY_AUTH=htpasswd" \
+  -e "REGISTRY_AUTH_HTPASSWD_REALM=Registry Realm" \
+  -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd \
+  -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/reg.crt \
+  -e REGISTRY_HTTP_TLS_KEY=/certs/reg.key \
+  --name my-registry-container \
+  -d \
+  docker.io/registry:2
+
+# test
+curl -u regadmin:passw0rd -k https://bastion.ocp47.mydomain.com:5000/v2/_catalog
+
+
+
+### Cloud Pak Foundation Services ######################################################
+# https://www.ibm.com/docs/en/cloud-paks/1.0?topic=airgap-installing-foundational-services-in-air-gapped-environment
+
+# create work folder
+mkdir -p /storage/install/cp
+cd /storage/install/cp
+
+# grab the latest from https://github.com/IBM/cloud-pak-cli/releases
+curl -s https://github.com/IBM/cloud-pak-cli/releases/download/v3.11.0/cloudctl-linux-amd64.tar.gz | tar -xvz
+
+# change access and move to bin
+chmod 755 cloudctl-linux-amd64
+mv cloudctl-linux-amd64 /usr/local/bin/cloudctl
+
+# RHEL7 - skopeo need to be above version 1.0.0, so we need some workaround
+curl -L -o /etc/yum.repos.d/devel:kubic:libcontainers:stable.repo https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/CentOS_7/devel:kubic:libcontainers:stable.repo
+yum clean all
+rm -rf /var/cache/yum/*
+
+# install skopeo (both RHEL7 and RHEL8)
+yum -y install skopeo
+
+# define some environment variable
+export CASE_NAME=ibm-cp-common-services
+export CASE_VERSION=1.3.1
+export CASE_ARCHIVE=$CASE_NAME-$CASE_VERSION.tgz
+export CASE_INVENTORY_SETUP=ibmCommonServiceOperatorSetup
+export OFFLINEDIR=/storage/install/cp/offline
+export CASE_REPO_PATH=https://github.com/IBM/cloud-pak/raw/master/repo/case
+export CASE_LOCAL_PATH=$OFFLINEDIR/$CASE_ARCHIVE
+
+export REGISTRY=bastion.ocp47.mydomain.com:5000
+export REGISTRY_USER=regadmin
+export REGISTRY_PASSWORD=passw0rd
+
+# Download the IBM Cloud Pak foundational services installer and image inventory to your host
+cloudctl case save \
+  --repo $CASE_REPO_PATH \
+  --case $CASE_NAME \
+  --version $CASE_VERSION \
+  --outputdir $OFFLINEDIR
+
+# Configure external registry authentication
+cloudctl case launch \
+  --case $OFFLINEDIR/$CASE_ARCHIVE \
+  --inventory $CASE_INVENTORY_SETUP \
+  --action configure-creds-airgap \
+  --args "--registry $REGISTRY --user $REGISTRY_USER --pass $REGISTRY_PASSWORD"
+
+# mirroring images from IBM Cloud to external registry
+cloudctl case launch \
+  --case $CASE_LOCAL_PATH \
+  --inventory $CASE_INVENTORY_SETUP \
+  --action mirror-images \
+  --args "--registry $REGISTRY --inputDir $OFFLINEDIR"
+
+# define and create CP namespace
+export NAMESPACE=common-service
+oc new-project $NAMESPACE
+
+# Configure a global image pull secret and ImageContentSourcePolicy
+cloudctl case launch \
+  --case $CASE_LOCAL_PATH \
+  --inventory $CASE_INVENTORY_SETUP \
+  --action configure-cluster-airgap \
+  --namespace $NAMESPACE \
+  --args "--registry $REGISTRY --user $REGISTRY_USER --pass $REGISTRY_PASSWORD --inputDir $OFFLINEDIR"
+
+# Verify that the ImageContentSourcePolicy resource is created
+oc get imageContentSourcePolicy
+
+# add the local registry to the cluster insecureRegistries list
+oc patch image.config.openshift.io/cluster --type=merge -p '{"spec":{"registrySources":{"insecureRegistries":["'${REGISTRY}'"]}}}'
+
+# Create and configure a catalog source
+cloudctl case launch \
+  --case $CASE_LOCAL_PATH \
+  --inventory $CASE_INVENTORY_SETUP \
+  --action install-catalog \
+  --namespace $NAMESPACE \
+  --args "--registry $REGISTRY"
+
+# check
+oc get pods -n openshift-marketplace
+oc get catalogsource -n openshift-marketplace
+
+# Install the foundational services operators
+cloudctl case launch \
+  --case $CASE_LOCAL_PATH \
+  --inventory $CASE_INVENTORY_SETUP \
+  --action install-operator \
+  --args "--size small" \
+  --namespace $NAMESPACE
+
+# approx 53 pods and 15 min to install all
+# check progress via console or
+watch oc get pod -n ibm-common-services
+
+# get login info :)
+echo "Host: https://$(oc get route -n ibm-common-services cp-console -o jsonpath={.spec.host})"
+echo "Username: admin"
+echo "Password: $(oc -n ibm-common-services get secret platform-auth-idp-credentials -o jsonpath='{.data.admin_password}' | base64 -d)"
+
+
+
+### Replacing the foundational services endpoint certificate ######################################################
+# https://www.ibm.com/docs/en/cloud-paks/1.0?topic=management-replacing-foundational-services-endpoint-certificates
+
+# telling to operator, that do not recreate - we will create it :)
+oc -n ibm-common-services patch managementingress default --type merge --patch '{"spec":{"ignoreRouteCert":true}}'
+
+# delete cert
+oc -n ibm-common-services delete certificate route-cert
+oc -n ibm-common-services delete secret route-tls-secret
+
+# create a new
+oc -n ibm-common-services create secret generic route-tls-secret \
+  --from-file=ca.crt=/storage/install/certificates/ca.crt  \
+  --from-file=tls.crt=/storage/install/certificates/ocp.crt  \
+  --from-file=tls.key=/storage/install/certificates/ocp.key
+
+# delete secret - this will be recreated using the new cert
+oc -n ibm-common-services delete secret ibmcloud-cluster-ca-cert
+
+# pick-up changes
+oc -n ibm-common-services delete pod -l app=auth-idp
+
+# check
+oc get pods -n ibm-common-services -l app=auth-idp
+
+
+
+# login via CP console without any issue! :)
