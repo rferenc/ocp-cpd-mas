@@ -382,6 +382,10 @@ curl -L -o /etc/yum.repos.d/devel:kubic:libcontainers:stable.repo https://downlo
 yum clean all
 rm -rf /var/cache/yum/*
 
+
+# RHEL 8 - enable additional repository
+subscription-manager repos --enable=rhel-8-for-x86_64-appstream-eus-rpms
+
 # install skopeo (both RHEL7 and RHEL8)
 yum -y install skopeo
 
