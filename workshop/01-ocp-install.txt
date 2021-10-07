@@ -1,8 +1,5 @@
-
-### Environment ###
-echo "LANG=en_US.utf-8" >> /etc/environment
-echo "LC_ALL=en_US.utf-8" >> /etc/environment
-
+###
+# I recommend CentOS 8 for the bastion node! :)
 
 
 ### Network setup ###
@@ -18,29 +15,9 @@ hostnamectl set-hostname bastion.ocp47.mydomain.com
 systemctl restart NetworkManager.service
 
 
+### Install packages ###
 
-### RHEL subscription ###
-
-subscription-manager register --username rhusername --password 'rhpassword'
-subscription-manager refresh
-
-subscription-manager list --available
-
-# you will need: Red Hat OpenShift Container Platform
-subscription-manager attach --pool=aaabbbccc111222333
-
-# subscription-manager repos --list
-subscription-manager repos --enable=rhel-7-server-extras-rpms
-# subscription-manager repos --enable=rhel-8-server-extras-rpms
-
-# yum -y update
-
-yum -y install net-tools haproxy wget httpd selinux-policy podman httpd-tools git bind-utils
-
-#RHEL 7
-yum -y install policycoreutils-python
-#RHEL 8
-yum -y install policycoreutils-python-utils
+yum -y install net-tools haproxy wget httpd selinux-policy podman httpd-tools git bind-utils policycoreutils-python-utils skopeo
 
 
 
@@ -95,12 +72,7 @@ cat <<EOF > /etc/exports.d/openshift.exports
 /storage/shares/pv_0003 *(rw,no_root_squash,no_wdelay)
 EOF
 
-# RHEL 7 - start service(s)
-systemctl start rpcbind
-systemctl start nfs-lock
-systemctl start nfs
-
-# RHEL 8 - start service(s)
+# Start service(s)
 systemctl start rpcbind
 systemctl start nfs-server
 
@@ -202,7 +174,7 @@ LABEL local
   LOCALBOOT 0
 EOF
 
-# copy some files (both for RH7 and RH8 - if missing, then skip it)
+# copy some files
 cp /usr/share/syslinux/pxelinux.0 /storage/tftpboot/
 cp /usr/share/syslinux/menu.c32 /storage/tftpboot/
 cp /usr/share/syslinux/ldlinux.c32 /storage/tftpboot/
@@ -258,10 +230,9 @@ dhcp-host=00:50:56:8b:fb:1c,control-1,192.168.47.12
 dhcp-host=00:50:56:8b:9e:ab,control-2,192.168.47.13
 dhcp-boot=pxelinux.0,pxeserver,192.168.47.1
 
-# Gateway
-dhcp-option=3,192.168.0.3
-# NTP Server
-dhcp-option=42,192.168.0.2
+dhcp-option=option:dns-server,192.168.47.1
+dhcp-option=option:router,192.168.0.3
+dhcp-option=option:ntp-server,192.168.0.2
 
 enable-tftp
 tftp-root=/storage/tftpboot
@@ -279,8 +250,11 @@ firewall-cmd --reload
 # SELinux settings
 /usr/sbin/semanage fcontext -a -t tftpdir_t "/storage/tftpboot(/.*)?"
 /sbin/restorecon -R -v /storage/tftpboot
+/usr/sbin/semanage permissive -a dnsmasq_t
 
-# enable and restart service(s)
+# change to start later, enable and restart service(s)
+sed -i 's/After=network.target/After=network-online.target/' /lib/systemd/system/dnsmasq.service
+systemctl daemon-reload
 systemctl enable dnsmasq
 systemctl restart dnsmasq
 
@@ -289,7 +263,8 @@ systemctl restart dnsmasq
 # EOF
 
  # replace nameserver to local
- sed -i "s/192.168.0.2/192.168.47.1/" /etc/resolv.conf
+ nmcli con mod ens192 ipv4.dns "10.107.47.1"
+ systemctl restart NetworkManager.service
 
 
 
@@ -339,8 +314,6 @@ cp 0A6B2F15 0A6B2F17
 
 
 ### Openshift installation ###
-
-cd /root
 
 # create a new ssh key
 ssh-keygen -N "" -f /root/.ssh/id_rsa

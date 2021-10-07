@@ -377,18 +377,6 @@ curl -s https://github.com/IBM/cloud-pak-cli/releases/download/v3.11.0/cloudctl-
 chmod 755 cloudctl-linux-amd64
 mv cloudctl-linux-amd64 /usr/local/bin/cloudctl
 
-# RHEL7 - skopeo need to be above version 1.0.0, so we need some workaround
-curl -L -o /etc/yum.repos.d/devel:kubic:libcontainers:stable.repo https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/CentOS_7/devel:kubic:libcontainers:stable.repo
-yum clean all
-rm -rf /var/cache/yum/*
-
-
-# RHEL 8 - enable additional repository
-subscription-manager repos --enable=rhel-8-for-x86_64-appstream-eus-rpms
-
-# install skopeo (both RHEL7 and RHEL8)
-yum -y install skopeo
-
 # define some environment variable
 export CASE_NAME=ibm-cp-common-services
 export CASE_VERSION=1.3.1
