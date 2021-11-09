@@ -1,0 +1,1004 @@
+
+### Preparation ###
+# to download Cloud Pak for Data from IBM Container Registry (cp.icr.io)
+# you need to provide your Entitlement key in a file at /root directory
+# named "entitlement.txt"
+# You can get your key from https://myibm.ibm.com/products-services/containerlibrary
+
+# login to your Openshift cluster
+oc login --insecure-skip-tls-verify -u admin -p passw0rd https://api.ocp47.mydomain.com:6443
+
+
+
+### Openshift Container Storage / Data Foundation ###
+# https://access.redhat.com/documentation/en-us/red_hat_openshift_container_storage/4.7/html-single/deploying_openshift_container_storage_using_bare_metal_infrastructure/index
+
+# We will use internal approach, which is simple. Details: https://access.redhat.com/documentation/en-us/red_hat_openshift_container_storage/4.7/html/planning_your_deployment/ocs-architecture_rhocs#storage-cluster-deployment-approaches_rhocs
+# Don't forget to add a new raw disk (for example 256G) for the first 3 worker node (compute-0, compute-1, compute-2) ! :)
+
+# if you prefer you can use the Openshift console
+# https://access.redhat.com/documentation/en-us/red_hat_openshift_container_storage/4.7/html/deploying_openshift_container_storage_using_bare_metal_infrastructure/deploy-using-local-storage-devices-bm#installing-local-storage-operator_rhocs
+
+# create a project
+oc adm new-project openshift-storage
+oc project openshift-storage
+
+# Operator Group in the new namespace
+cat <<EOF |oc apply -f -
+apiVersion: operators.coreos.com/v1alpha2
+kind: OperatorGroup
+metadata:
+  name: operatorgroup
+  namespace: openshift-storage
+spec:
+  targetNamespaces:
+  - openshift-storage
+EOF
+
+# subscribe to Local Storage operator
+cat <<EOF |oc apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: openshift-local-storage-operator
+  namespace: openshift-storage
+spec:
+  channel: '4.7'
+  installPlanApproval: Automatic
+  name: local-storage-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  startingCSV: local-storage-operator.4.7.0-202110121415
+EOF
+
+# you can check installation status
+# oc get csv/local-storage-operator.4.7.0-202110121415 -n openshift-storage -o jsonpath='{.status.phase}'
+oc get csv -n openshift-storage
+
+# label the nodes which has a raw disk and will run the OCS cluster
+oc label nodes compute-0 compute-1 compute-2 cluster.ocs.openshift.io/openshift-storage=''
+
+# Run the local volume discovery on the listed nodes
+cat <<EOF |oc apply -f -
+apiVersion: local.storage.openshift.io/v1alpha1
+kind: LocalVolumeDiscovery
+metadata:
+  name: auto-discover-devices
+  namespace: openshift-storage
+spec:
+  nodeSelector:
+    nodeSelectorTerms:
+      - matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: In
+            values:
+              - compute-0
+              - compute-1
+              - compute-2
+EOF
+
+# check status
+# oc get LocalVolumeDiscovery/auto-discover-devices -n openshift-storage -o jsonpath='{.status.phase}'
+oc get LocalVolumeDiscovery/auto-discover-devices -n openshift-storage
+
+# create a volume set
+cat <<EOF |oc apply -f -
+apiVersion: local.storage.openshift.io/v1alpha1
+kind: LocalVolumeSet
+metadata:
+  name: localblock
+  namespace: openshift-storage
+spec:
+    deviceInclusionSpec:
+      deviceMechanicalProperties:
+      - Rotational
+      deviceTypes:
+      - disk
+      - part
+      minSize: 200Gi
+    nodeSelector:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values:
+          - compute-0
+          - compute-1
+          - compute-2
+    storageClassName: localblock
+    volumeMode: Block
+EOF
+
+# check the running - you need to wait until 3 provision appear
+# oc get LocalVolumeSet/localblock -n openshift-storage -o jsonpath='{.status.totalProvisionedDeviceCount}'
+oc get LocalVolumeSet/localblock -n openshift-storage
+# as you can see 3 PersistentVolume was created (1 by each node)
+oc get pv | grep localblock
+# and a new storageClass - we will use it to create the OCS cluster
+oc get sc | grep localblock
+
+# let's install OCS operator with a subscription
+cat <<EOF |oc apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: ocs-operator
+  namespace: openshift-storage
+spec:
+  channel: stable-4.7
+  installPlanApproval: Automatic
+  name: ocs-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  startingCSV: ocs-operator.v4.7.5
+EOF
+
+# monitor the installation
+# oc get csv/ocs-operator.v4.7.5 -n openshift-storage -o jsonpath='{.status.phase}'
+# oc get pods -n openshift-storage -o wide
+watch oc get csv -n openshift-storage
+
+# create the OCS cluster - nodes also specified where our cluster will run
+cat <<EOF |oc apply -f -
+apiVersion: ocs.openshift.io/v1
+kind: StorageCluster
+metadata:
+  name: ocs-storagecluster
+  namespace: openshift-storage
+spec:
+  storageDeviceSets:
+    - count: 3
+      dataPVCTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: '1'
+          storageClassName: localblock
+          volumeMode: Block
+      name: ocs-deviceset-localblock
+      replica: 1
+  monDataDirHostPath: /var/lib/rook
+  version: 4.7.0
+  flexibleScaling: true
+EOF
+
+# monitor the installation
+watch oc get csv,storagecluster.ocs.openshift.io -n openshift-storage
+
+# you need to get 4 new OCS related storageClass in the list
+oc get sc
+
+
+
+### Cloud Pak for Data ###
+
+# Good starting point to ensure that you complete the appropriate tasks in the correct order:
+#  https://www.ibm.com/docs/en/cloud-paks/cp-data/4.0?topic=installing
+
+# in our case OpenShift and Cloud Pak Foundational Services already installed
+
+
+## Changing node settings
+# https://www.ibm.com/support/producthub/icpdata/docs/content/SSQNUZ_latest/cpd/install/node-settings.html
+
+
+# CRI-O container settings
+
+# pick a worker node
+WORKER=$(oc get nodes | grep worker | head -1 | awk '{print $1}')
+ssh-keyscan -H ${WORKER} >> /root/.ssh/known_hosts
+# and download a current crio.conf
+scp core@${WORKER}:/etc/crio/crio.conf /tmp/crio.conf
+
+# remove comments, empty lines, and "pids_limit"
+cat  /tmp/crio.conf | grep -v -e "^#" | grep -v -e "^$" | grep -v pids_limit > /root/ocp4/crio.conf
+# add ulimits and pids_limit with correct values for CPD
+sed -i '/\[crio.runtime\]/a\
+default_ulimits = [\
+        "nofile=66560:66560"\
+]\
+pids_limit = 12288 ' /root/ocp4/crio.conf
+
+# create a new MachineConfig with the new crio.conf
+cat << EOF | oc apply -f -
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  labels:
+    machineconfiguration.openshift.io/role: worker
+  name: 99-worker-cp4d-crio-conf
+spec:
+  config:
+    ignition:
+      version: 3.1.0
+    storage:
+      files:
+      - contents:
+          source: data:text/plain;charset=utf-8;base64,$(cat /root/ocp4/crio.conf | base64 -w0)
+        filesystem: root
+        mode: 0644
+        overwrite: true
+        path: /etc/crio/crio.conf
+EOF
+
+# all nodes need to be updated - you need to wait at least it will start to distributed
+watch oc get nodes
+# watch oc get mcp
+
+# Kernel parameter settings
+#   Enabling unsafe sysctls
+cat << EOF | oc apply -f -
+apiVersion: machineconfiguration.openshift.io/v1
+kind: KubeletConfig
+metadata:
+  name: cpd-kubelet
+spec:
+  machineConfigPoolSelector:
+    matchLabels:
+      cpd-kubelet: sysctl
+  kubeletConfig:
+    allowedUnsafeSysctls:
+      - "kernel.msg*"
+      - "kernel.shm*"
+      - "kernel.sem"
+EOF
+oc label machineconfigpool worker cpd-kubelet=sysctl
+
+# Kernel optimalization on all compute nodes - a new DaemonSet with required sysctl
+cat << EOF | oc apply -f -
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kernel-optimization
+  namespace: kube-system
+  labels:
+    tier: management
+    app: kernel-optimization
+spec:
+  selector:
+    matchLabels:
+      name: kernel-optimization
+  template:
+    metadata:
+      labels:
+        name: kernel-optimization
+    spec:
+      hostNetwork: true
+      hostPID: true
+      hostIPC: true
+      initContainers:
+        - command:
+            - sh
+            - -c
+            - sysctl -w kernel.sem="250 1024000 100 32768"; sysctl -w kernel.msgmax="65536"; sysctl -w kernel.msgmnb="65536"; sysctl -w  kernel.msgmni="32768"; sysctl -w kernel.shmmni="32768"; sysctl -w vm.max_map_count="262144"; sysctl -w kernel.shmall="33554432"; sysctl -w kernel.shmmax="68719476736"; sysctl -p;
+          image: alpine:3.6
+          imagePullPolicy: IfNotPresent
+          name: sysctl
+          resources: {}
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - NET_ADMIN
+          volumeMounts:
+            - name: modifysys
+              mountPath: /sys
+      containers:
+        - resources:
+            requests:
+              cpu: 0.01
+          image: alpine:3.6
+          name: sleepforever
+          command: ["/bin/sh", "-c"]
+          args:
+            - >
+              while true; do
+                sleep 100000;
+              done
+      volumes:
+        - name: modifysys
+          hostPath:
+            path: /sys
+EOF
+
+
+
+# Mirroring images to our external registry
+# https://www.ibm.com/docs/en/cloud-paks/cp-data/4.0?topic=registry-mirroring-images-bastion-node
+export CASE_REPO_PATH=https://github.com/IBM/cloud-pak/raw/master/repo/case
+export OFFLINEDIR=/storage/install/cp/offline
+export USE_SKOPEO=true
+# we will use different folder for each component
+export OFFLINEDIR_CP=$OFFLINEDIR/core
+export OFFLINEDIR_WA=$OFFLINEDIR/assistant
+export OFFLINEDIR_WD=$OFFLINEDIR/discovery
+# external registry informations
+export REGISTRY=bastion.ocp47.mydomain.com:5000
+export REGISTRY_USER=regadmin
+export REGISTRY_PASSWORD=passw0rd
+
+# create our work folders
+mkdir -p $OFFLINEDIR_CP
+mkdir -p $OFFLINEDIR_WA
+mkdir -p $OFFLINEDIR_WD
+cd $OFFLINEDIR_CP
+
+# Download the IBM Cloud Pak for Data platform operator package
+cloudctl case save \
+  --case ${CASE_REPO_PATH}/ibm-cp-datacore-2.0.5.tgz \
+  --outputdir ${OFFLINEDIR_CP} \
+  --no-dependency
+
+# Store the IBM Entitled Registry credentials
+cloudctl case launch \
+  --case ${OFFLINEDIR_CP}/ibm-cp-datacore-2.0.5.tgz \
+  --inventory cpdPlatformOperator \
+  --action configure-creds-airgap \
+  --args "--registry cp.icr.io --user cp --pass $(cat /root/entitlement.txt) --inputDir ${OFFLINEDIR_CP}"
+
+# Remove Postgres - we don't have license for this
+sed -i -e '/edb-postgres-advanced/d' ${OFFLINEDIR_CP}/ibm-cloud-native-postgresql-4.0.*-images.csv
+
+# Mirror images from cp.icr.io to our external registry
+cloudctl case launch \
+  --case ${OFFLINEDIR_CP}/ibm-cp-datacore-2.0.5.tgz \
+  --inventory cpdPlatformOperator \
+  --action mirror-images \
+  --args "--registry ${REGISTRY} --user ${REGISTRY_USER} --pass ${REGISTRY_PASSWORD} --inputDir ${OFFLINEDIR_CP}"
+
+# If you mirrored images to a private container registry, you must tell your cluster where to find the images
+# https://www.ibm.com/docs/en/cloud-paks/cp-data/4.0?topic=tasks-configuring-your-cluster-pull-images#preinstall-cluster-setup__image-content-source-policy
+cat <<EOF |oc apply -f -
+apiVersion: operator.openshift.io/v1alpha1
+kind: ImageContentSourcePolicy
+metadata:
+  name: cloud-pak-for-data-mirror
+spec:
+  repositoryDigestMirrors:
+  - mirrors:
+    - ${REGISTRY}/cp
+    source: cp.icr.io/cp
+  - mirrors:
+    - ${REGISTRY}/cp/cpd
+    source: cp.icr.io/cp/cpd
+  - mirrors:
+    - ${REGISTRY}/cpopen
+    source: icr.io/cpopen
+EOF
+
+# check
+oc get imageContentSourcePolicy
+# wait until all nodes will be updated
+watch oc get nodes
+
+# Create a new catalog source
+cloudctl case launch \
+  --case ${OFFLINEDIR_CP}/ibm-cp-datacore-2.0.5.tgz \
+  --inventory cpdPlatformOperator \
+  --namespace openshift-marketplace \
+  --action install-catalog \
+    --args "--inputDir ${OFFLINEDIR_CP} --recursive"
+
+# check
+oc get catalogsource -n openshift-marketplace | grep -E "IBM|Cloudpak"
+# Need to be READY
+oc get catalogsource -n openshift-marketplace cpd-platform -o jsonpath='{.status.connectionState.lastObservedState} {"\n"}'
+
+# We need to create some namespaces
+# https://www.ibm.com/docs/en/cloud-paks/cp-data/4.0?topic=tasks-creating-projects-namespaces
+oc new-project cpd-operators
+oc new-project cpd-instance
+
+# new operator group for cpd-operators namespace
+cat <<EOF |oc apply -f -
+apiVersion: operators.coreos.com/v1alpha2
+kind: OperatorGroup
+metadata:
+  name: operatorgroup
+  namespace: cpd-operators
+spec:
+  targetNamespaces:
+  - cpd-operators
+EOF
+
+# CPD Operator Subscription
+cat <<EOF |oc apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: cpd-operator
+  namespace: cpd-operators
+spec:
+  channel: v2.0
+  installPlanApproval: Automatic
+  name: cpd-platform-operator
+  source: cpd-platform
+  sourceNamespace: openshift-marketplace
+EOF
+
+# wait to SUCCEEDED
+watch oc get csv -n cpd-operators
+
+# get deployment status
+oc get deployment -n cpd-operators
+
+# if we use separated namespaces for CP Foundation, CPD operators and CPD instance,
+# then we need to allow to perform operations on all of our namespaces
+# https://www.ibm.com/docs/en/cpfs?topic=co-authorizing-foundational-services-perform-operations-workloads-in-namespace
+cat <<EOF |oc apply -f -
+apiVersion: operator.ibm.com/v1
+kind: NamespaceScope
+metadata:
+  name: cpd-operators
+  namespace: ibm-common-services
+spec:
+  csvInjector:
+    enable: true
+  namespaceMembers:
+  - cpd-operators
+  - cpd-instance
+EOF
+
+# Create a custom resource to install Cloud Pak for Data with Red Hat Openshift Data Foundation / Container Storage
+# ocs-storagecluster-cephfs and ocs-storagecluster-ceph-rbd
+# https://www.ibm.com/support/producthub/icpdata/docs/content/SSQNUZ_latest/cpd/install/install-overview.html
+cat <<EOF |oc apply -f -
+apiVersion: cpd.ibm.com/v1
+kind: Ibmcpd
+metadata:
+  name: ibmcpd-cr
+  namespace: cpd-instance
+spec:
+  license:
+    accept: true
+    license: Enterprise
+  storageClass: ocs-storagecluster-cephfs
+  zenCoreMetadbStorageClass: ocs-storagecluster-ceph-rbd
+  cloudpakfordata: true
+  iamIntegration: false
+  generateAdminPassword: false
+  cert_manager_enabled: true
+EOF
+
+# check the installation
+oc get -n cpd-instance Ibmcpd/ibmcpd-cr
+# watch oc get -n cpd-instance Ibmcpd/ibmcpd-cr -o jsonpath="{.status}"
+# It can take up to 90 minutes, but around 20 min
+# around 9 deployments
+watch oc get pods,deployments -n cpd-instance
+
+# if finished, below 2 command results "COMPLETED"
+oc get -n cpd-instance Ibmcpd/ibmcpd-cr -o jsonpath="{.status.controlPlaneStatus}{'\n'}"
+oc get -n cpd-instance ZenService/lite-cr -o jsonpath="{.status.zenStatus}{'\n'}"
+
+# get login info for CPD console :)
+echo "Host: https://$(oc get ZenService lite-cr -n cpd-instance -o jsonpath="{.status.url}{'\n'}")"
+echo "Username: admin"
+echo "Password: $(oc extract secret/admin-user-details -n cpd-instance --keys=initial_admin_password --to=-)"
+
+# change route TLS cert
+# https://www.ibm.com/support/producthub/icpdata/docs/content/SSQNUZ_latest/cpd/install/https-config-openshift.html
+# create secret
+oc create secret generic external-tls-secret -n cpd-instance --from-file=cert.crt=/storage/install/certificates/ocp.crt --from-file=cert.key=/storage/install/certificates/ocp.key --dry-run=client -o yaml | oc apply -f -
+sleep 20
+# reload NGINX
+for i in `oc get pods -n cpd-instance  | grep ibm-nginx |  cut -f1 -d\ `; do oc exec -n cpd-instance ${i} -- /scripts/reload.sh; done
+
+
+
+
+
+### Watson Assistant ###
+
+# https://www.ibm.com/support/producthub/icpdata/docs/content/SSQNUZ_latest/svc-assistant/assistant-svc-install.html
+
+# for Watson Assistant we need to download the CASE file
+cloudctl case save \
+--case ${CASE_REPO_PATH}/ibm-watson-assistant-4.0.2.tgz \
+--outputdir ${OFFLINEDIR_WA}
+
+# remove Postgres due we don't have license
+sed -i -e '/edb-postgres-advanced/d' ${OFFLINEDIR_WA}/ibm-cloud-native-postgresql-4.0.*-images.csv
+
+# mirror WA images to our external registry
+cloudctl case launch \
+  --case ${OFFLINEDIR_WA}/ibm-watson-assistant-4.0.2.tgz \
+  --inventory assistantOperator \
+  --action mirror-images \
+  --args "--registry ${REGISTRY} --user ${REGISTRY_USER} --pass ${REGISTRY_PASSWORD} --inputDir ${OFFLINEDIR_WA}"
+
+# install WA catalog
+cloudctl case launch \
+  --case ${OFFLINEDIR_WA}/ibm-watson-assistant-4.0.2.tgz \
+  --inventory assistantOperator \
+  --namespace openshift-marketplace \
+  --action install-catalog \
+    --args "--inputDir ${OFFLINEDIR_WA} --recursive"
+
+# check
+oc get catalogsource -n openshift-marketplace | grep -E "IBM|Cloudpak"
+oc get catalogsource -n openshift-marketplace ibm-watson-assistant-operator-catalog -o jsonpath='{.status.connectionState.lastObservedState} {"\n"}'
+
+# prereq to get Postgres operator
+# we need to install where our CPD core created - looking for a service account
+# create Postgres license secret
+cloudctl case launch \
+  --case ${OFFLINEDIR_WA}/ibm-watson-assistant-4.0.2.tgz \
+  --inventory assistantOperator \
+  --action create-postgres-licensekey \
+  --namespace cpd-instance
+# install Postgres operator
+cloudctl case launch \
+  --case ${OFFLINEDIR_WA}/ibm-watson-assistant-4.0.2.tgz \
+  --inventory assistantOperator \
+  --action install-postgres-operator \
+  --namespace cpd-instance \
+  --args "--inputDir ${OFFLINEDIR_WA}"
+# check
+watch oc get csv -n cpd-instance
+
+# install the WA operator
+# https://www.ibm.com/support/producthub/icpdata/docs/content/SSQNUZ_latest/cpd/install/preinstall-operator-subscriptions.html
+cat <<EOF |oc apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: ibm-watson-assistant-operator-subscription
+  namespace: cpd-instance
+spec:
+  channel: v4.0
+  name: ibm-watson-assistant-operator
+  source: ibm-watson-assistant-operator-catalog
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic
+EOF
+
+# wait to finish
+watch oc get csv -n cpd-instance
+# check deployments
+oc get deployments -n cpd-instance
+# and WA status
+oc get sub -n cpd-instance ibm-watson-assistant-operator-subscription
+oc get sub -n cpd-instance ibm-watson-assistant-operator-subscription -o jsonpath='{.status.installedCSV} {"\n"}'
+oc get csv -n cpd-instance ibm-watson-assistant-operator.v4.0.2 -o jsonpath='{ .status.phase } : { .status.message} {"\n"}'
+oc get deployments -n cpd-instance -l olm.owner="ibm-watson-assistant-operator.v4.0.2" -o jsonpath="{.items[0].status.availableReplicas} {'\n'}"
+
+# temporary fix to allow certificates to be enabled for the Certificate management service
+export INSTANCE=wa
+oc project cpd-instance
+
+# a very long YAML with 6 TemporaryPatch definition ....
+cat <<EOF | oc apply -f -
+apiVersion: assistant.watson.ibm.com/v1
+kind: TemporaryPatch
+metadata:
+  name: ${INSTANCE}-fix-clu-certs
+spec:
+  apiVersion: assistant.watson.ibm.com/v1
+  kind: WatsonAssistantClu
+  name: ${INSTANCE}
+  patchType: patchJson6902
+  patch:
+      certmanager:
+        cert-nlu:
+          - op: remove
+            path: /spec/dnsNames/3
+          - op: remove
+            path: /spec/dnsNames/2
+          - op: add
+            path: /spec/ipAddresses
+            value: ["127.0.0.1", "::1"]
+        cert-clu-embedding:
+          - op: remove
+            path: /spec/dnsNames/3
+          - op: remove
+            path: /spec/dnsNames/2
+          - op: add
+            path: /spec/ipAddresses
+            value: ["127.0.0.1", "::1"]
+        cert-clu-serving:
+          - op: remove
+            path: /spec/dnsNames/3
+          - op: remove
+            path: /spec/dnsNames/2
+          - op: add
+            path: /spec/ipAddresses
+            value: ["127.0.0.1", "::1"]
+        cert-clu-training:
+          - op: remove
+            path: /spec/dnsNames/3
+          - op: remove
+            path: /spec/dnsNames/2
+          - op: add
+            path: /spec/ipAddresses
+            value: ["127.0.0.1", "::1"]
+        cert-dragonfly-clu-mm:
+          - op: remove
+            path: /spec/dnsNames/3
+          - op: remove
+            path: /spec/dnsNames/2
+          - op: add
+            path: /spec/ipAddresses
+            value: ["127.0.0.1", "::1"]
+        cert-ed:
+          - op: remove
+            path: /spec/dnsNames/4
+          - op: remove
+            path: /spec/dnsNames/3
+          - op: add
+            path: /spec/ipAddresses
+            value: ["127.0.0.1", "::1"]
+        cert-master:
+          - op: remove
+            path: /spec/dnsNames/3
+          - op: remove
+            path: /spec/dnsNames/2
+          - op: add
+            path: /spec/ipAddresses
+            value: ["127.0.0.1", "::1"]
+        cert-recommends:
+          - op: remove
+            path: /spec/dnsNames/2
+          - op: remove
+            path: /spec/dnsNames/1
+          - op: add
+            path: /spec/ipAddresses
+            value: ["127.0.0.1", "::1"]
+        cert-spellchecker-mm:
+          - op: remove
+            path: /spec/dnsNames/15
+          - op: remove
+            path: /spec/dnsNames/14
+          - op: remove
+            path: /spec/dnsNames/3
+          - op: remove
+            path: /spec/dnsNames/2
+          - op: add
+            path: /spec/ipAddresses
+            value: ["127.0.0.1", "::1"]
+        cert-system-entities:
+          - op: remove
+            path: /spec/dnsNames/3
+          - op: remove
+            path: /spec/dnsNames/2
+          - op: add
+            path: /spec/ipAddresses
+            value: ["127.0.0.1", "::1"]
+        cert-tfmm:
+          - op: remove
+            path: /spec/dnsNames/3
+          - op: remove
+            path: /spec/dnsNames/2
+          - op: add
+            path: /spec/ipAddresses
+            value: ["127.0.0.1", "::1"]
+---
+apiVersion: assistant.watson.ibm.com/v1
+kind: TemporaryPatch
+metadata:
+  name: ${INSTANCE}-fix-analytics-certs
+spec:
+  apiVersion: assistant.watson.ibm.com/v1
+  kind: WatsonAssistantAnalytics
+  name: ${INSTANCE}
+  patchType: patchJson6902
+  patch:
+      certmanager:
+        cert-analytics:
+          - op: remove
+            path: /spec/dnsNames/3
+          - op: remove
+            path: /spec/dnsNames/2
+          - op: add
+            path: /spec/ipAddresses
+            value: ["127.0.0.1", "::1"]
+---
+apiVersion: assistant.watson.ibm.com/v1
+kind: TemporaryPatch
+metadata:
+  name: ${INSTANCE}-fix-integrations-certs
+spec:
+  apiVersion: assistant.watson.ibm.com/v1
+  kind: WatsonAssistantIntegrations
+  name: ${INSTANCE}
+  patchType: patchJson6902
+  patch:
+      certmanager:
+        cert-integrations:
+          - op: remove
+            path: /spec/dnsNames/2
+          - op: remove
+            path: /spec/dnsNames/1
+          - op: add
+            path: /spec/ipAddresses
+            value: ["127.0.0.1", "::1"]
+---
+apiVersion: assistant.watson.ibm.com/v1
+kind: TemporaryPatch
+metadata:
+  name: ${INSTANCE}-fix-recommends-certs
+spec:
+  apiVersion: assistant.watson.ibm.com/v1
+  kind: WatsonAssistantRecommends
+  name: ${INSTANCE}
+  patchType: patchJson6902
+  patch:
+      certmanager:
+        cert-recommends:
+          - op: remove
+            path: /spec/dnsNames/2
+          - op: remove
+            path: /spec/dnsNames/1
+          - op: add
+            path: /spec/ipAddresses
+            value: ["127.0.0.1", "::1"]
+---
+apiVersion: assistant.watson.ibm.com/v1
+kind: TemporaryPatch
+metadata:
+  name: ${INSTANCE}-fix-ui-certs
+spec:
+  apiVersion: assistant.watson.ibm.com/v1
+  kind: WatsonAssistantUi
+  name: ${INSTANCE}
+  patchType: patchJson6902
+  patch:
+      certmanager:
+        cert-ui:
+          - op: remove
+            path: /spec/dnsNames/2
+          - op: remove
+            path: /spec/dnsNames/1
+          - op: add
+            path: /spec/ipAddresses
+            value: ["127.0.0.1", "::1"]
+---
+apiVersion: assistant.watson.ibm.com/v1
+kind: TemporaryPatch
+metadata:
+  name: ${INSTANCE}-fix-wa-certs
+spec:
+  apiVersion: assistant.watson.ibm.com/v1
+  kind: WatsonAssistant
+  name: ${INSTANCE}
+  patchType: patchJson6902
+  patch:
+      certmanager:
+        cert-elasticSearch-store:
+          - op: remove
+            path: /spec/dnsNames/1
+          - op: add
+            path: /spec/ipAddresses
+            value: ["127.0.0.1"]
+          - op: add
+            path: /spec/commonName
+            value: localhost
+        cert-cos:
+          - op: remove
+            path: /spec/dnsNames/1
+          - op: add
+            path: /spec/ipAddresses
+            value: ["127.0.0.1"]
+EOF
+
+# create a WA instance
+cat <<EOF | oc apply -f -
+apiVersion: assistant.watson.ibm.com/v1
+kind: WatsonAssistant
+metadata:
+  name: wa
+  namespace: cpd-instance
+  annotations:
+    oppy.ibm.com/disable-rollback: "true"
+    oppy.ibm.com/log-default-level: "debug"
+    oppy.ibm.com/log-filters: ""
+    oppy.ibm.com/log-thread-id: "false"
+    oppy.ibm.com/log-json: "false"
+    oppy.ibm.com/temporary-patches: '{"wa-fix-wa-certs": {"timestamp": "2021-10-13T18:45:57.959534", "api_version": "assistant.watson.ibm.com/v1"}}'
+  labels:
+    app.kubernetes.io/managed-by: "Ansible"
+    app.kubernetes.io/name: "watson-assistant"
+    app.kubernetes.io/instance: "wa"
+spec:
+  backup:
+    offlineQuiesce: false
+    onlineQuiesce: false
+  cluster:
+    dockerRegistryPrefix: ""
+    imagePullSecrets: []
+    storageClassName: ocs-storagecluster-ceph-rbd
+    type: private
+    name: prod
+  cpd:
+    namespace: cpd-instance
+  datastores:
+    cos:
+      storageClassName: ""
+      storageSize: 20Gi
+    datagovernor:
+      elasticSearch:
+        storageSize: 55Gi
+      etcd:
+        storageSize: 55Gi
+      kafka:
+        storageSize: 55Gi
+      storageClassName: "ocs-storagecluster-ceph-rbd"
+      zookeeper:
+        storageSize: 55Gi
+    elasticSearch:
+      analytics:
+        storageClassName: ""
+        storageSize: ""
+      store:
+        storageClassName: ""
+        storageSize: ""
+    etcd:
+      storageClassName: ""
+      storageSize: 2Gi
+    kafka:
+      storageClassName: ""
+      storageSize: 5Gi
+      zookeeper:
+        storageSize: 1Gi
+    modelTrain:
+      postgres:
+        storageClassName: "ocs-storagecluster-ceph-rbd"
+        storageSize: 55Gi
+      rabbitmq:
+        storageClassName: "ocs-storagecluster-ceph-rbd"
+        storageSize: 55Gi
+    postgres:
+      backupStorageClassName: ""
+      storageClassName: ""
+      storageSize: 5Gi
+    redis:
+      storageClassName: ""
+      storageSize: ""
+  features:
+    analytics:
+      enabled: false
+    recommends:
+      enabled: true
+    tooling:
+      enabled: true
+    voice:
+      enabled: false
+  labels: {}
+  languages:
+  - en
+  - xx
+  license:
+    accept: true
+  size: small     # Options are small, medium, and large
+  version: 4.0.2
+EOF
+# Supported sizes:
+#    https://cloud.ibm.com/docs/assistant-data?topic=assistant-data-install-400
+# Supported languages:
+#    https://cloud.ibm.com/docs/assistant-data?topic=assistant-data-language-support
+
+# monitor the installation
+watch oc get -n cpd-instance WatsonAssistant wa
+oc get -n cpd-instance WatsonAssistant wa -o jsonpath='{.status.watsonAssistantStatus} {"\n"}'
+
+# Deployment Verification Testing
+# https://www.ibm.com/support/producthub/icpdata/docs/content/SSQNUZ_latest/svc-assistant/assistant-svc-post-install.html
+oc get wa -o custom-columns=NAME:.metadata.name
+cat <<EOF | oc apply -f -
+apiVersion: assistant.watson.ibm.com/v1
+kind: WatsonAssistantDvt
+metadata:
+  name: wa
+  namespace: cpd-instance
+  annotations:
+    oppy.ibm.com/disable-rollback: "true"
+spec:
+  labels:
+    "app.kubernetes.io/instance": "cpd-instance"
+  version: 4.0.2
+  # The name of the Watson Assistant instance to target with this DVT
+  assistantInstanceName: cpd-instance
+  # The cucumber test tags to execute
+  testTags: "@accuracy,@callouts,@dialogs,@dialogErrors,@dialogV1,@dialogV1errors,@embedsearch,@entities,@exactMatch,@folders,@fuzzy,@generic,@healthcheck,@intents,@languagexx,@newse,@openentities,@patterns,@prebuilt,@recommends,@search,@slots,@spellcheck,@spellcheckfr,@v2assistants,@v2authorskill,@v2authorwksp,@v2healthcheck,@v2skillref,@v2snapshots,@workspaces"
+  cluster:
+    type: "private"
+    # :image_pull_secrets: pull secret names
+    imagePullSecrets: []
+    dockerRegistryPrefix: ""
+EOF
+
+
+
+### Watson Discovery ###
+# https://www.ibm.com/support/producthub/icpdata/docs/content/SSQNUZ_latest/svc-discovery/discovery-install-overview.html
+
+# download case file
+cloudctl case save \
+--case ${CASE_REPO_PATH}/ibm-watson-discovery-4.0.2.tgz \
+--outputdir ${OFFLINEDIR_WD}
+
+# remove advanced Postgres
+sed -i -e '/edb-postgres-advanced/d' ${OFFLINEDIR_WD}/ibm-cloud-native-postgresql-4.0.*-images.csv
+
+# mirror images
+cloudctl case launch \
+  --case ${OFFLINEDIR_WA}/ibm-watson-discovery-4.0.2.tgz \
+  --inventory assistantOperator \
+  --action mirror-images \
+  --args "--registry ${REGISTRY} --user ${REGISTRY_USER} --pass ${REGISTRY_PASSWORD} --inputDir ${OFFLINEDIR_WD}"
+
+# install catalog
+cloudctl case launch \
+  --case ${OFFLINEDIR_WD}/ibm-watson-discovery-4.0.2.tgz \
+  --inventory discoveryOperators \
+  --namespace openshift-marketplace \
+  --action install-catalog \
+    --args "--inputDir ${OFFLINEDIR_WD} --recursive"
+# check status
+oc get catalogsource -n openshift-marketplace | grep -E "IBM|Cloudpak"
+oc get catalogsource -n openshift-marketplace ibm-watson-discovery-operator-catalog -o jsonpath='{.status.connectionState.lastObservedState} {"\n"}'
+
+# already did "create-postgres-licensekey" & "install-postgres-operator" :)
+
+# install WD operator
+cat <<EOF |oc apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  labels:
+    app.kubernetes.io/instance: ibm-watson-discovery-operator-subscription
+    app.kubernetes.io/managed-by: ibm-watson-discovery-operator
+    app.kubernetes.io/name: ibm-watson-discovery-operator-subscription
+  name: ibm-watson-discovery-operator-subscription
+  namespace: cpd-instance
+spec:
+  channel: v4.0
+  name: ibm-watson-discovery-operator
+  source: ibm-watson-discovery-operator-catalog
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic
+EOF
+
+# monitor installation
+watch oc get csv -n cpd-instance
+oc get deployments -n cpd-instance
+
+# check status
+oc get sub -n cpd-instance ibm-watson-discovery-operator-subscription
+oc get sub -n cpd-instance ibm-watson-discovery-operator-subscription -o jsonpath='{.status.installedCSV} {"\n"}'
+oc get csv -n cpd-instance ibm-watson-discovery-operator.v4.0.2 -o jsonpath='{ .status.phase } : { .status.message} {"\n"}'
+oc get deployments -n cpd-instance -l olm.owner="ibm-watson-discovery-operator.v4.0.2" -o jsonpath="{.items[0].status.availableReplicas} {'\n'}"
+
+# create a WD instance
+cat <<EOF |oc apply -f -
+apiVersion: discovery.watson.ibm.com/v1
+kind: WatsonDiscovery
+metadata:
+  labels:
+    app.kubernetes.io/instance: wd
+    app.kubernetes.io/managed-by: Ansible
+    app.kubernetes.io/name: discovery
+  annotations:
+    oppy.ibm.com/disable-rollback: 'true'
+  name: wd
+  namespace: cpd-instance
+spec:
+  license:
+    accept: true
+  version: 4.0.2
+  shared:
+    storageClassName: ocs-storagecluster-ceph-rbd
+    deploymentType: Development
+  watsonGateway:
+    version: main
+EOF
+# check status
+oc get -n cpd-instance WatsonDiscovery wd -o jsonpath='{.status.watsonDiscoveryStatus} {"\n"}'
+
+# you can monitor WA and WD installation together - it can takes a long time
+watch oc get -n cpd-instance WatsonAssistant,WatsonDiscovery
+
+
+# if succeed, you can login to CDP ui and start to work! :)
