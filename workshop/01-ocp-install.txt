@@ -119,6 +119,14 @@ sed -i -e "/timeout server/s/ [0-9].*/ 5m/" ocp4-haproxy.cfg
 # activate config
 mv -f ocp4-haproxy.cfg /etc/haproxy/haproxy.cfg
 
+
+# To accept asymmetrically routed packets
+echo "net.ipv4.conf.default.rp_filter = 2" >> /etc/sysctl.conf
+echo "net.ipv4.conf.all.rp_filter = 2" >> /etc/sysctl.conf
+echo 2 > /proc/sys/net/ipv4/conf/default/rp_filter
+echo 2 > /proc/sys/net/ipv4/conf/all/rp_filter
+
+
 # SELinux settings
 setsebool -P haproxy_connect_any=1
 semanage permissive -a haproxy_t
