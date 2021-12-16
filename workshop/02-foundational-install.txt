@@ -6,6 +6,8 @@ export KUBECONFIG=/root/ocp4/auth/kubeconfig
 
 
 ### NFS Storage ######################################################
+# remark: NFS storage used as a demo environment only !
+# Official supported storage options: https://www.ibm.com/docs/en/cpfs?topic=operator-storage-options
 
 # create work folder
 mkdir -p /storage/install/nfs
@@ -410,6 +412,10 @@ cloudctl case launch \
   --inventory $CASE_INVENTORY_SETUP \
   --action mirror-images \
   --args "--registry $REGISTRY --inputDir $OFFLINEDIR"
+
+# IMPORTANT!!!
+# Please be aware, that if you use air-gapped installation, you will not get
+# any updated or fix for vulnerabilities !!!
 
 # define and create CP namespace
 export NAMESPACE=common-service

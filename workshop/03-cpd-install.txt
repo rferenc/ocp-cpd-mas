@@ -348,6 +348,10 @@ cloudctl case launch \
   --action mirror-images \
   --args "--registry ${REGISTRY} --user ${REGISTRY_USER} --pass ${REGISTRY_PASSWORD} --inputDir ${OFFLINEDIR_CP}"
 
+# IMPORTANT!!!
+# Please be aware, that if you use air-gapped installation, you will not get
+# any updated or fix for vulnerabilities !!!
+
 # If you mirrored images to a private container registry, you must tell your cluster where to find the images
 # https://www.ibm.com/docs/en/cloud-paks/cp-data/4.0?topic=tasks-configuring-your-cluster-pull-images#preinstall-cluster-setup__image-content-source-policy
 cat <<EOF |oc apply -f -
@@ -461,6 +465,8 @@ spec:
   generateAdminPassword: false
   cert_manager_enabled: true
 EOF
+
+# Storage options: https://www.ibm.com/docs/en/cloud-paks/cp-data/4.0?topic=planning-storage-considerations
 
 # check the installation
 oc get -n cpd-instance Ibmcpd/ibmcpd-cr
