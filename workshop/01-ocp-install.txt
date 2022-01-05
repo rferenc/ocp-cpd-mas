@@ -364,6 +364,7 @@ networking:
 platform:
   none: {}
 pullSecret: '$(cat /root/pullsecret.txt)'
+sshKey: '$(cat /root/.ssh/id_rsa.pub)'
 EOF
 
 # create the manifest files
