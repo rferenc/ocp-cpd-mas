@@ -1,0 +1,592 @@
+
+
+### Install packages ###
+yum -y install net-tools haproxy wget httpd selinux-policy podman httpd-tools git bind-utils skopeo jq policycoreutils-python-utils
+
+
+
+
+
+### setup HAproxy ###
+
+wget https://raw.githubusercontent.com/openshift-tigerteam/guides/master/ocp4/ocp4-haproxy.cfg
+
+# vi /etc/haproxy/haproxy.cfg
+
+# enable automatic stat refresh
+sed -i '/stats enable/a\
+    stats refresh 10s' ocp4-haproxy.cfg
+
+# bootstrap
+sed -i 's/192.168.1.96/192.168.48.10/' ocp4-haproxy.cfg
+
+# masters
+sed -i 's/master/control-/' ocp4-haproxy.cfg
+sed -i 's/192.168.1.97/192.168.48.11/' ocp4-haproxy.cfg
+sed -i 's/192.168.1.98/192.168.48.12/' ocp4-haproxy.cfg
+sed -i 's/192.168.1.99/192.168.48.13/' ocp4-haproxy.cfg
+
+# workers
+sed -i 's/worker/compute-/' ocp4-haproxy.cfg
+sed -i 's/192.168.1.11/192.168.48.21/' ocp4-haproxy.cfg
+sed -i 's/192.168.1.7/192.168.48.22/' ocp4-haproxy.cfg
+
+# additional workers :)
+sed -i '/server compute-1 192.168.48.22:80 check/a\
+    server compute-2 192.168.48.23:80 check\
+    server compute-3 192.168.48.24:80 check\
+    server compute-4 192.168.48.25:80 check\
+    server compute-5 192.168.48.26:80 check' ocp4-haproxy.cfg
+sed -i '/server compute-1 192.168.48.22:443 check/a\
+    server compute-2 192.168.48.23:443 check\
+    server compute-3 192.168.48.24:443 check\
+    server compute-4 192.168.48.25:443 check\
+    server compute-5 192.168.48.26:443 check' ocp4-haproxy.cfg
+
+# change timeout for CPD
+sed -i -e "/timeout client/s/ [0-9].*/ 5m/" ocp4-haproxy.cfg
+sed -i -e "/timeout server/s/ [0-9].*/ 5m/" ocp4-haproxy.cfg
+
+
+mv -f ocp4-haproxy.cfg /etc/haproxy/haproxy.cfg
+
+# To accept asymmetrically routed packets
+# https://github.com/openshift-telco/openshift4x-poc
+echo "net.ipv4.conf.default.rp_filter = 2" >> /etc/sysctl.conf
+echo "net.ipv4.conf.all.rp_filter = 2" >> /etc/sysctl.conf
+echo 2 > /proc/sys/net/ipv4/conf/default/rp_filter
+echo 2 > /proc/sys/net/ipv4/conf/all/rp_filter
+
+# SELinux setup
+setsebool -P haproxy_connect_any=1
+semanage permissive -a haproxy_t
+
+# service and firewall setup
+systemctl enable haproxy
+systemctl start haproxy
+
+firewall-cmd --zone=public --add-port=80/tcp --permanent
+firewall-cmd --zone=public --add-port=443/tcp --permanent
+firewall-cmd --zone=public --add-port=22623/tcp --permanent
+firewall-cmd --zone=public --add-port=9000/tcp --permanent
+firewall-cmd --zone=public --add-port=6443/tcp --permanent
+firewall-cmd --reload
+
+
+
+
+
+### HTTPd ###
+
+# change port
+sed -i 's/Listen 80/Listen 8080/' /etc/httpd/conf/httpd.conf
+
+# service and firewall setup
+
+systemctl enable httpd
+systemctl start httpd
+
+firewall-cmd --zone=public --add-port=8080/tcp --permanent
+firewall-cmd --reload
+
+
+
+
+
+### DNSMasq, PXE, tftp ###
+
+yum -y install dnsmasq syslinux
+
+mkdir -p /storage/tftpboot/pxelinux.cfg
+
+cat <<EOF >  /storage/tftpboot/pxelinux.cfg/default
+default menu.c32
+prompt 0
+timeout 300
+ONTIMEOUT local
+menu title ### PXE Boot Menu ###
+LABEL local
+  MENU LABEL Boot first disk
+  LOCALBOOT 0
+EOF
+
+cp /usr/share/syslinux/pxelinux.0 /storage/tftpboot/
+cp /usr/share/syslinux/menu.c32 /storage/tftpboot/
+cp /usr/share/syslinux/ldlinux.c32 /storage/tftpboot/
+cp /usr/share/syslinux/libutil.c32 /storage/tftpboot/
+
+
+mkdir /storage/tftpboot/images
+cd /storage/tftpboot/images
+
+
+# https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos
+
+wget https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.8/4.8.14/rhcos-4.8.14-x86_64-live-kernel-x86_64
+wget https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.8/4.8.14/rhcos-4.8.14-x86_64-live-initramfs.x86_64.img
+
+cp /etc/dnsmasq.conf /etc/dnsmasq.conf.backup
+
+
+cat <<EOF > /etc/dnsmasq.conf
+
+interface=lo,ens192
+bind-interfaces
+listen-address=127.0.0.1,192.168.48.1
+cache-size=1000
+resolv-file=/etc/resolv.dnsmasq
+no-poll
+
+expand-hosts
+domain=ocp48.domain.com
+server=192.168.1.1        # parent DNS server
+address=/bastion.ocp48.domain.com/192.168.48.1
+address=/apps.ocp48.domain.com/192.168.48.1
+address=/api.ocp48.domain.com/192.168.48.1
+address=/api-int.ocp48.domain.com/192.168.48.1
+address=/etcd-0.ocp48.domain.com/192.168.48.11
+address=/etcd-1.ocp48.domain.com/192.168.48.12
+address=/etcd-2.ocp48.domain.com/192.168.48.13
+srv-host=_etcd-server-ssl._tcp.ocp48.domain.com,etcd-0.ocp48.domain.com,2380,0,10
+srv-host=_etcd-server-ssl._tcp.ocp48.domain.com,etcd-1.ocp48.domain.com,2380,0,10
+srv-host=_etcd-server-ssl._tcp.ocp48.domain.com,etcd-2.ocp48.domain.com,2380,0,10
+
+dhcp-range=192.168.48.2,192.168.48.100,12h
+dhcp-ignore=tag:!known
+dhcp-leasefile=/var/lib/dnsmasq/dnsmasq.leases
+dhcp-authoritative
+dhcp-host=00:50:56:8b:00:00,bootstrap,192.168.48.10
+dhcp-host=00:50:56:8b:00:01,compute-0,192.168.48.21
+dhcp-host=00:50:56:8b:00:02,compute-1,192.168.48.22
+dhcp-host=00:50:56:8b:00:03,compute-2,192.168.48.23
+dhcp-host=00:50:56:8b:00:04,compute-3,192.168.48.24
+dhcp-host=00:50:56:8b:00:05,compute-4,192.168.48.25
+dhcp-host=00:50:56:8b:00:06,compute-5,192.168.48.26
+dhcp-host=00:50:56:8b:00:07,control-0,192.168.48.11
+dhcp-host=00:50:56:8b:00:08,control-1,192.168.48.12
+dhcp-host=00:50:56:8b:00:09,control-2,192.168.48.13
+dhcp-boot=pxelinux.0,pxeserver,192.168.48.1
+dhcp-option=option:dns-server,192.168.48.1
+dhcp-option=option:router,192.168.0.1
+dhcp-option=option:ntp-server,192.168.1.1
+
+enable-tftp
+tftp-root=/storage/tftpboot
+
+log-facility=/var/log/dnsmasq.log
+
+EOF
+
+
+firewall-cmd --add-service=dns --permanent      ## Port 53
+firewall-cmd --add-service=dhcp --permanent     ## Port 67
+firewall-cmd --add-port=69/udp --permanent      ## Port for TFTP
+firewall-cmd --reload
+
+
+/usr/sbin/semanage fcontext -a -t tftpdir_t "/storage/tftpboot(/.*)?"
+/sbin/restorecon -R -v /storage/tftpboot
+/usr/sbin/semanage permissive -a dnsmasq_t
+
+sed -i 's/After=network.target/After=network-online.target/' /lib/systemd/system/dnsmasq.service
+systemctl daemon-reload
+
+systemctl enable dnsmasq
+systemctl restart dnsmasq
+
+
+nmcli con mod ens192 ipv4.dns "192.168.48.1"
+systemctl restart NetworkManager.service
+
+
+
+
+
+###    PXE RHCOS 4.8 version
+
+cd /storage/tftpboot/pxelinux.cfg
+
+rm -rf C0A830*
+
+cat <<EOF >  C0A8300A
+DEFAULT pxeboot
+TIMEOUT 20
+PROMPT 0
+LABEL pxeboot
+    KERNEL images/rhcos-4.8.14-x86_64-live-kernel-x86_64
+    APPEND initrd=images/rhcos-4.8.14-x86_64-live-initramfs.x86_64.img coreos.live.rootfs_url=http://192.168.48.1:8080/install/rhcos-4.8.14-x86_64-live-rootfs.x86_64.img coreos.inst.install_dev=/dev/sda coreos.inst.ignition_url=http://192.168.48.1:8080/ignition/bootstrap.ign
+EOF
+
+cp C0A8300A C0A8300B
+
+sed -i "s/bootstrap.ign/master.ign/" C0A8300B
+cp C0A8300B C0A8300C
+cp C0A8300B C0A8300D
+cp C0A8300B C0A8300E
+cp C0A8300B C0A8300F
+
+
+cp C0A8300A C0A83015
+sed -i "s/bootstrap.ign/worker.ign/" C0A83015
+cp C0A83015 C0A83016
+cp C0A83015 C0A83017
+cp C0A83015 C0A83018
+cp C0A83015 C0A83019
+cp C0A83015 C0A8301A
+
+
+
+
+
+### OCP Preparation ###
+
+cd /usr/local/bin/
+
+# https://mirror.openshift.com/pub/openshift-v4/clients/ocp/
+
+curl -s https://mirror.openshift.com/pub/openshift-v4/clients/ocp/4.8.42/openshift-client-linux-4.8.42.tar.gz | tar -xvz
+curl -s https://mirror.openshift.com/pub/openshift-v4/clients/ocp/4.8.42/openshift-install-linux-4.8.42.tar.gz | tar -xvz
+
+
+# * * * ACTION! * * *
+# Get your pull secret from https://cloud.redhat.com/openshift/install/metal/user-provisioned
+# Upload to bastion at /root/pullsecret.txt or create a file with your secret
+#       $ ls -l /root/pullsecret.txt
+#       -rw-r--r--. 1 root root 2747 Jan 10 15:22 /root/pullsecret.txt
+
+
+ssh-keygen -N "" -f /root/.ssh/id_rsa
+
+mkdir ~/ocp4
+cd ~/ocp4
+
+cat <<EOF > ~/ocp4/install-config.yaml
+apiVersion: v1
+baseDomain: domain.com
+compute:
+- hyperthreading: Enabled
+  name: worker
+  replicas: 0
+controlPlane:
+  hyperthreading: Enabled
+  name: master
+  replicas: 3
+metadata:
+  name: ocp48
+networking:
+  clusterNetworks:
+  - cidr: 10.254.0.0/16
+    hostPrefix: 22
+  networkType: OpenShiftSDN
+  serviceNetwork:
+  - 172.30.0.0/16
+platform:
+  none: {}
+pullSecret: '$(cat /root/pullsecret.txt)'
+sshKey: '$(cat /root/.ssh/id_rsa.pub)'
+EOF
+
+
+
+
+
+### OCP install ###
+
+openshift-install create manifests
+sed -i 's/mastersSchedulable: true/mastersSchedulable: false/' manifests/cluster-scheduler-02-config.yml
+
+openshift-install create ignition-configs
+
+
+mkdir -p /var/www/html/{ignition,install}
+
+# https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/
+wget -P  /var/www/html/install ftp://10.107.0.2/ocp4/rhcos-4.8.14-x86_64-live-rootfs.x86_64.img
+
+cp ~/ocp4/*.ign /var/www/html/ignition/
+
+chmod +r -R /var/www/html/*
+chcon -R -t httpd_sys_content_t /var/www/html/
+
+
+# To monitor the progress:
+# ssh -i /root/.ssh/id_rsa core@bootstrap
+# journalctl -b -f -u release-image.service -u bootkube.service
+#  bootkube.service: Succeeded.
+
+openshift-install wait-for bootstrap-complete --log-level debug
+
+
+export KUBECONFIG=/root/ocp4/auth/kubeconfig
+oc get nodes
+
+oc get clusterversion
+
+
+# around Working towards 4.8.42: 86% complete
+# check & approve node certificates - 2x each additional nodes (6 nodes -> 12 certificate)
+
+# oc get csr
+
+watch "oc get csr | grep -i -v approved "
+
+oc get csr | awk '/Pending/ { print $1 }' | xargs oc adm certificate approve
+
+# wait a minute and again :)
+
+
+watch " oc get co | grep -v '4.8.42    True        False         False'"
+
+
+# wait to finish...
+openshift-install wait-for install-complete
+
+
+# final checks
+oc get nodes
+oc get csr
+oc get clusterversion
+oc get co
+oc get mcp
+
+
+
+
+###############################################
+
+### HTPasswd ###
+
+htpasswd -bBc /root/ocp4/ocp4_password admin passw0rd
+htpasswd -bB /root/ocp4/ocp4_password developer developer
+
+oc create secret generic htpass-secret --from-file=htpasswd=/root/ocp4/ocp4_password -n openshift-config
+
+cat << EOF > /root/ocp4/htpasswd.yaml
+apiVersion: config.openshift.io/v1
+kind: OAuth
+metadata:
+  name: cluster
+spec:
+  identityProviders:
+  - name: Simple provider
+    mappingMethod: claim
+    type: HTPasswd
+    htpasswd:
+      fileData:
+        name: htpass-secret
+EOF
+oc apply -f /root/ocp4/htpasswd.yaml
+
+oc adm policy add-cluster-role-to-user cluster-admin admin
+
+
+
+
+
+### ODF via OCP Console GUI ####
+# add disk to 3 worker
+#
+# install Local Storage operator
+# create Local Volume Discovery
+# create Local Volume Set
+#
+# install OpenShift Container Storage operator
+# create StorageCluster - "Internal - Attached Devices"
+
+
+
+
+
+### Internal registry ###
+
+# modify internal registry to
+#   - activate
+#   - accessible from the network
+#   - use NFS storage - this is the default SC
+#   - 3 replica / run on each master node
+
+# registry pvc
+
+cat << EOF > /root/ocp4/ocs4registry.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ocs4registry
+  namespace: openshift-image-registry
+spec:
+  storageClassName: ocs-storagecluster-cephfs
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 128Gi
+EOF
+
+oc create -f /root/ocp4/ocs4registry.yaml
+
+# oc edit configs.imageregistry.operator.openshift.io/cluster
+oc patch configs.imageregistry.operator.openshift.io/cluster --type merge --patch '{"spec":{"defaultRoute":true,"managementState":"Managed","rolloutStrategy":"Recreate","replicas":3,"storage":{"pvc":{"claim":"ocs4registry"}}}}'
+
+# watch oc get all -n openshift-image-registry
+
+oc registry info
+oc registry info --internal
+
+
+
+
+
+### Login via OAuth ###
+
+oc login --insecure-skip-tls-verify -u admin -p passw0rd https://api.ocp48.domain.com:6443
+
+
+
+
+
+### Cloud Pak for Data ##########################################
+
+### IBM pull secret ###
+# if you plan to install any IBM Cloud Paks, then we need to add your entitlement key to the global pull secret
+
+cd /root
+
+# * * * ACTION! * * *
+# Copy your entitlement key from https://myibm.ibm.com/products-services/containerlibrary
+# Upload to bastion at /root/entitlement.txt or create a file with your key
+#       $ ls -l /root/entitlement.txt
+#       -rw-r--r--. 1 root root 177 Jan 10 15:22 /root/entitlement.txt
+
+export CPD_KEY=$(cat entitlement.txt)
+
+# get current pull secrets
+oc extract secret/pull-secret -n openshift-config
+
+# add your entitlement key
+# ---- copy the next 14 lines as one command !
+if [ -s .dockerconfigjson ]
+then
+    # file not empty
+    b64_credential=`echo -n "cp:$CPD_KEY" | base64 -w0`
+    sed -i -e 's|:{|:{"cp.icr.io":{"auth":"'$b64_credential'"\},|' .dockerconfigjson
+    oc set data secret/pull-secret -n openshift-config --from-file=.dockerconfigjson=.dockerconfigjson
+else
+    # file is empty
+    oc create secret pull-secret \
+        --docker-server=cp.icr.io\
+        --docker-username=cp \
+        --docker-password=$CPD_KEY \
+        -n openshift-config pull-secret
+fi
+# ---- end of copy
+
+
+
+### projects ###
+
+oc new-project ibm-common-services
+oc new-project cpd-operators
+oc new-project cpd-instance
+
+cat <<EOF |oc apply -f -
+apiVersion: operators.coreos.com/v1alpha2
+kind: OperatorGroup
+metadata:
+  name: operatorgroup
+  namespace: ibm-common-services
+spec:
+  targetNamespaces:
+  - ibm-common-services
+EOF
+
+cat <<EOF |oc apply -f -
+apiVersion: operators.coreos.com/v1alpha2
+kind: OperatorGroup
+metadata:
+  name: operatorgroup
+  namespace: cpd-operators
+spec:
+  targetNamespaces:
+  - cpd-operators
+EOF
+
+
+### CatalogSource ###
+
+
+cat <<EOF |oc apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: ibm-operator-catalog
+  namespace: openshift-marketplace
+spec:
+  displayName: "IBM Operator Catalog"
+  publisher: IBM
+  sourceType: grpc
+  image: icr.io/cpopen/ibm-operator-catalog:latest
+  updateStrategy:
+    registryPoll:
+      interval: 45m
+EOF
+
+
+
+### Subscription ###
+
+cat <<EOF |oc apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: cpd-operator
+  namespace: cpd-operators
+spec:
+  channel: v2.0
+  installPlanApproval: Automatic
+  name: cpd-platform-operator
+  source: ibm-operator-catalog
+  sourceNamespace: openshift-marketplace
+EOF
+
+oc get csv -n cpd-operators cpd-platform-operator.v2.0.8 -o jsonpath='{ .status.phase } : { .status.message} {"\n"}'
+
+
+oc patch NamespaceScope common-service -n ibm-common-services --type=merge --patch='{"spec": {"csvInjector": {"enable": true} } }'
+
+cat <<EOF |oc apply -f -
+apiVersion: operator.ibm.com/v1alpha1
+kind: OperandRequest
+metadata:
+  name: empty-request
+  namespace: cpd-instance
+spec:
+  requests: []
+EOF
+
+
+cat <<EOF |oc apply -f -
+apiVersion: cpd.ibm.com/v1
+kind: Ibmcpd
+metadata:
+  name: ibmcpd-cr
+  namespace: cpd-instance
+  csNamespace: ibm-common-services
+spec:
+  license:
+    accept: true
+    license: Enterprise
+  storageVendor: ocs
+EOF
+
+
+# check the status
+oc project cpd-instance
+
+oc get Ibmcpd ibmcpd-cr -o jsonpath="{.status.controlPlaneStatus}{'\n'}"
+oc get ZenService lite-cr -o jsonpath="{.status.zenStatus}{'\n'}"
+
+# wait until each of them will be "Completed"
+
+# get CPD url and admin password
+oc get ZenService lite-cr -o jsonpath="{.status.url}{'\n'}"
+oc extract secret/admin-user-details --keys=initial_admin_password --to=-
