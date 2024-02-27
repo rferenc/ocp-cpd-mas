@@ -1,0 +1,218 @@
+
+
+
+
+### Part 0 - Preparation
+
+!!! COPY OC LOGIN COMMAND FROM OPENSHIFT CONSOLE!!!
+
+# yum install -y tmux podman jq
+
+curl -sL https://github.com/IBM/cpd-cli/releases/download/v13.1.2/cpd-cli-linux-EE-13.1.2.tgz | tar -xvz
+cd cpd-cli-linux-EE-13.1.2-89
+
+
+# Install parameters
+# https://www.ibm.com/docs/en/cloud-paks/cp-data/4.8.x?topic=information-setting-up-installation-environment-variables
+
+
+export IBM_ENTITLEMENT_KEY=$(cat /home/admin/entitlementkey.txt)
+
+# export OCP_USERNAME=kubeadmin
+# export OCP_PASSWORD=
+export OCP_TOKEN=$(oc whoami -t)
+
+export CPD_CLI_MANAGE_WORKSPACE=$(pwd)/cpd-cli-workspace/olm-utils-workspace
+export OLM_UTILS_IMAGE=icr.io/cpopen/cpd/olm-utils-v2:latest
+
+export IMAGE_ARCH=amd64
+
+export OCP_URL=$(oc config view -o json | jq -r '.clusters[0].cluster.server')
+export OPENSHIFT_TYPE=self-managed
+export IMAGE_ARCH=amd64
+
+export SERVER_ARGUMENTS="--server=${OCP_URL}"
+# export LOGIN_ARGUMENTS="--username=${OCP_USERNAME} --password=${OCP_PASSWORD}"
+export LOGIN_ARGUMENTS="--token=${OCP_TOKEN}"
+export CPDM_OC_LOGIN="cpd-cli manage login-to-ocp ${SERVER_ARGUMENTS} ${LOGIN_ARGUMENTS}"
+export OC_LOGIN="oc login ${OCP_URL} ${LOGIN_ARGUMENTS}"
+# export OC_LOGIN="oc --insecure-skip-tls-verify login ${OCP_URL} ${LOGIN_ARGUMENTS}"
+
+export PROJECT_CERT_MANAGER=ibm-cert-manager
+export PROJECT_LICENSE_SERVICE=ibm-licensing
+export PROJECT_SCHEDULING_SERVICE=cpd-scheduler
+export PROJECT_CPD_INST_OPERATORS=cpd-operators
+export PROJECT_CPD_INST_OPERANDS=cpd-instance
+
+export STG_CLASS_BLOCK=ocs-storagecluster-ceph-rbd
+export STG_CLASS_FILE=ocs-storagecluster-cephfs
+
+export VERSION=4.8.2
+
+export COMPONENTS=ibm-cert-manager,ibm-licensing,scheduler,cpfs,cpd_platform,db2wh,dmc
+
+PATH=$(pwd):$PATH
+
+
+# https://www.ibm.com/docs/en/cloud-paks/cp-data/4.8.x?topic=workstation-installing-cloud-pak-data-cli
+cpd-cli manage restart-container
+
+
+
+
+### Part 1 - Installing CPD Core
+
+export COMPONENTS=ibm-cert-manager,ibm-licensing,scheduler,cpfs,cpd_platform
+
+
+${CPDM_OC_LOGIN}
+
+# https://www.ibm.com/docs/en/cloud-paks/cp-data/4.8.x?topic=cluster-updating-global-image-pull-secret
+
+cpd-cli manage add-icr-cred-to-global-pull-secret \
+--entitled_registry_key=${IBM_ENTITLEMENT_KEY}
+
+
+# https://www.ibm.com/docs/en/cloud-paks/cp-data/4.8.x?topic=cluster-installing-shared-components
+
+cpd-cli manage apply-cluster-components \
+--release=${VERSION} \
+--license_acceptance=true \
+--cert_manager_ns=${PROJECT_CERT_MANAGER} \
+--licensing_ns=${PROJECT_LICENSE_SERVICE}
+
+
+cpd-cli manage apply-scheduler \
+--release=${VERSION} \
+--license_acceptance=true \
+--scheduler_ns=${PROJECT_SCHEDULING_SERVICE}
+
+
+# https://www.ibm.com/docs/en/cloud-paks/cp-data/4.8.x?topic=settings-changing-process-ids-limit
+
+${OC_LOGIN}
+
+oc apply -f - << EOF
+apiVersion: machineconfiguration.openshift.io/v1
+kind: KubeletConfig
+metadata:
+  name: cpd-pidslimit-kubeletconfig
+spec:
+  kubeletConfig:
+    podPidsLimit: 16384
+  machineConfigPoolSelector:
+    matchExpressions:
+    - key: pools.operator.machineconfiguration.openshift.io/worker
+      operator: Exists
+EOF
+
+
+# https://www.ibm.com/docs/en/cloud-paks/cp-data/4.8.x?topic=data-applying-required-permissions-projects-namespaces
+
+cpd-cli manage authorize-instance-topology \
+--cpd_operator_ns=${PROJECT_CPD_INST_OPERATORS} \
+--cpd_instance_ns=${PROJECT_CPD_INST_OPERANDS}
+
+
+# https://www.ibm.com/docs/en/cloud-paks/cp-data/4.8.x?topic=data-installing-cloud-pak-foundational-services
+
+cpd-cli manage setup-instance-topology \
+--release=${VERSION} \
+--cpd_operator_ns=${PROJECT_CPD_INST_OPERATORS} \
+--cpd_instance_ns=${PROJECT_CPD_INST_OPERANDS} \
+--license_acceptance=true \
+--block_storage_class=${STG_CLASS_BLOCK}
+
+
+# https://www.ibm.com/docs/en/cloud-paks/cp-data/4.8.x?topic=data-installing-cloud-pak
+
+cpd-cli manage apply-olm \
+--release=${VERSION} \
+--cpd_operator_ns=${PROJECT_CPD_INST_OPERATORS} \
+--components=${COMPONENTS}
+
+cpd-cli manage apply-cr \
+--release=${VERSION} \
+--cpd_instance_ns=${PROJECT_CPD_INST_OPERANDS} \
+--components=${COMPONENTS} \
+--block_storage_class=${STG_CLASS_BLOCK} \
+--file_storage_class=${STG_CLASS_FILE} \
+--parallel_num=1 \
+--license_acceptance=true
+
+
+cpd-cli manage get-cr-status \
+--cpd_instance_ns=${PROJECT_CPD_INST_OPERANDS}
+
+
+cpd-cli manage get-cpd-instance-details \
+--cpd_instance_ns=${PROJECT_CPD_INST_OPERANDS} \
+--get_admin_initial_credentials=true
+
+# oc get secret ibm-iam-bindinfo-platform-auth-idp-credentials -n ${PROJECT_CPD_INST_OPERANDS} -o jsonpath='{.data.admin_password}' | base64 --decode;
+
+
+### Part 2 - Installing components
+
+export COMPONENTS=db2wh,dmc
+
+# https://www.ibm.com/docs/en/cloud-paks/cp-data/4.8.x?topic=services-creating-db2-scc
+# https://www.ibm.com/docs/en/cloud-paks/cp-data/4.8.x?topic=settings-changing-kernel-parameter
+# https://www.ibm.com/docs/en/cloud-paks/cp-data/4.8.x?topic=data-specifying-privileges-that-db2u-runs
+oc apply -f - <<EOF
+apiVersion: v1
+data:
+  DB2U_RUN_WITH_LIMITED_PRIVS: "false"
+kind: ConfigMap
+metadata:
+  name: db2u-product-cm
+  namespace: ${PROJECT_CPD_INST_OPERATORS}
+EOF
+
+
+cpd-cli manage apply-olm \
+--release=${VERSION} \
+--cpd_operator_ns=${PROJECT_CPD_INST_OPERATORS} \
+--components=${COMPONENTS}
+
+
+cpd-cli manage apply-cr \
+--release=${VERSION} \
+--cpd_instance_ns=${PROJECT_CPD_INST_OPERANDS} \
+--components=${COMPONENTS} \
+--block_storage_class=${STG_CLASS_BLOCK} \
+--file_storage_class=${STG_CLASS_FILE} \
+--license_acceptance=true
+
+
+cpd-cli manage get-cr-status \
+--cpd_instance_ns=${PROJECT_CPD_INST_OPERANDS}
+
+
+
+
+### Part 3 - Day 1 administration
+
+# https://www.ibm.com/docs/en/cloud-paks/cp-data/4.8.x?topic=iims-configuring-cloud-pak-data-use-embedded-ldap-integration
+
+${OC_LOGIN}
+
+oc patch cm product-configmap \
+--namespace=${PROJECT_CPD_INST_OPERANDS} \
+--type=merge -n ${PROJECT_CPD_INST_OPERANDS} \
+--patch '{"data": {"zen_native_auth": "enabled"}}'
+
+oc rollout restart deployment usermgmt \
+--namespace=${PROJECT_CPD_INST_OPERANDS}
+
+oc rollout restart deployment zen-core \
+--namespace=${PROJECT_CPD_INST_OPERANDS}
+
+
+export CPD_ROUTE=$(oc get route cpd -n ${PROJECT_CPD_INST_OPERANDS} -o jsonpath={".spec.host"})
+export ADMIN_PASSWORD=$(oc get secret admin-user-details -n=${PROJECT_CPD_INST_OPERANDS} -o 'jsonpath={.data.initial_admin_password}' | base64 -d)
+
+echo "URL: https://$CPD_ROUTE"
+echo "Username: admin"
+echo "Password: $ADMIN_PASSWORD"
+
