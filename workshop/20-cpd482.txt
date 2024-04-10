@@ -210,9 +210,9 @@ oc rollout restart deployment zen-core \
 
 
 export CPD_ROUTE=$(oc get route cpd -n ${PROJECT_CPD_INST_OPERANDS} -o jsonpath={".spec.host"})
-export ADMIN_PASSWORD=$(oc get secret admin-user-details -n=${PROJECT_CPD_INST_OPERANDS} -o 'jsonpath={.data.initial_admin_password}' | base64 -d)
+export ADMIN_PASSWORD=$(oc get secret ibm-iam-bindinfo-platform-auth-idp-credentials -n ${PROJECT_CPD_INST_OPERANDS} -o jsonpath='{.data.admin_password}' | base64 --decode)
 
 echo "URL: https://$CPD_ROUTE"
-echo "Username: admin"
+echo "Username: cpadmin"
 echo "Password: $ADMIN_PASSWORD"
 
